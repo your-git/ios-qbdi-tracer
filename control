@@ -1,0 +1,9 @@
+Package: com.snk.qbditracer
+Name: iOS QBDI Tracer
+Version: 0.1-1
+Architecture: iphoneos-arm
+Description: Dobby + QBDI instruction-level tracer with control app
+Maintainer: Tk
+Author: Tk
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)

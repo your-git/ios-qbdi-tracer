@@ -1,0 +1,27 @@
+# ===== 构建产物 =====
+build/
+.theos/
+packages/
+*.deb
+
+# ===== 构建依赖(QBDI/Dobby 静态库与头文件,体积大,可重新生成/从 Release 下载) =====
+third_party/
+Engine/lib/
+Engine/include/
+
+# ===== macOS 系统文件 =====
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ===== 编辑器/IDE =====
+.vscode/
+.idea/
+*.swp
+*~
+xcuserdata/
+
+# ===== 日志与临时文件 =====
+*.log
+*.tmp
