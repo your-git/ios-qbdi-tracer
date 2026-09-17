@@ -132,6 +132,7 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     TrigRowWhere,
     TrigRowValue,
     TrigRowScan,
+    TrigRowClear,
 };
 
 #define TRIG_SCAN_DEFAULT 0x100  /* 同 Engine/src/config.h 的 TRIG_DEF_SCAN */
@@ -174,10 +175,11 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     }
     TrigMatchKind k = [self triggerMatch];
     if (k == TrigMatchNotNull) {
-        return @[ @(TrigRowExpr), @(TrigRowMatch) ];
+        return @[ @(TrigRowExpr), @(TrigRowMatch), @(TrigRowClear) ];
     }
     if (k == TrigMatchU64) {
-        return @[ @(TrigRowExpr), @(TrigRowMatch), @(TrigRowValue) ];
+        return @[ @(TrigRowExpr), @(TrigRowMatch), @(TrigRowValue),
+                  @(TrigRowClear) ];
     }
     /* 字节 / 字符串:多一个「匹配位置」,选了「包含」再多一个「最长读取」 */
     NSMutableArray *rows = [@[ @(TrigRowExpr), @(TrigRowMatch), @(TrigRowWhere),
@@ -185,6 +187,7 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     if ([self triggerWhere] == TrigWhereContains) {
         [rows addObject:@(TrigRowScan)];
     }
+    [rows addObject:@(TrigRowClear)];
     return rows;
 }
 
@@ -192,6 +195,15 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     TrigRowKind kind =
         (TrigRowKind)[[self triggerRows][row] integerValue];
     TrigMatchKind k = [self triggerMatch];
+
+    if (kind == TrigRowClear) {
+        UITableViewCell *c = [[UITableViewCell alloc]
+            initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        c.textLabel.text = @"改为无条件";
+        c.textLabel.textAlignment = NSTextAlignmentCenter;
+        c.textLabel.textColor = [UIColor systemRedColor];
+        return c;
+    }
 
     if (kind == TrigRowValue) {
         FieldCell *c = [self fieldCellKey:@"triggerValue"
@@ -348,7 +360,7 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     if (section == 3) {
         if (![self hasTrigger]) {
             return @"留空 = 每次命中都 trace。填了表达式后,只有内存内容匹配时才记录,"
-                   @"不匹配的调用完全不写日志、也不消耗 trace 次数。";
+                   @"不匹配的调用完全不写 trace 文件,并会继续等待后续匹配。";
         }
         BOOL contains = [self triggerWhere] == TrigWhereContains;
         if ([self triggerMatch] == TrigMatchBytes) {
@@ -378,7 +390,7 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     switch (section) {
         case 0: return 1;                 /* app 名 */
         case 1: return 3;                 /* module / start / end */
-        case 2: return 3;                 /* count / delaySecs / moduleOnly */
+        case 2: return 2;                 /* delaySecs / moduleOnly(count 固定隐藏) */
         case 3: return (NSInteger)[self triggerRows].count;
         case 4: return (NSInteger)[self.item[@"watches"] count] + 1; /* +添加 */
     }
@@ -408,10 +420,6 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     }
     if (ip.section == 2) {
         if (ip.row == 0) {
-            return [self fieldCellKey:@"count" label:@"Trace 次数"
-                          placeholder:@"1" numeric:YES];
-        }
-        if (ip.row == 1) {
             return [self fieldCellKey:@"delaySecs" label:@"延迟(秒)"
                           placeholder:@"0" numeric:YES];
         }
@@ -524,6 +532,7 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
             case TrigRowExpr:  [self promptTriggerExpr]; break;
             case TrigRowMatch: [self pickTriggerMatch]; break;
             case TrigRowWhere: [self pickTriggerWhere]; break;
+            case TrigRowClear: [self clearTrigger]; break;
             default: break; /* 输入框行,不用处理点击 */
         }
         return;

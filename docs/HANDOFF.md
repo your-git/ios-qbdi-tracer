@@ -29,10 +29,10 @@
 | `src/ExprInput.{h,m}` | ~250 | **取址表达式的输入与校验**,两个编辑页共用:`ExprSyntaxOK`/`ExprBaseReg`(轻量语法校验,**要与 `watch_expr.c` 的文法一致**)+ `ExprPrompt`(带寄存器/`[]`/`0x` 快捷栏、即时标红的输入弹窗) |
 | `src/HexValue.{h,m}` | ~50 | 「字节长度」类字段(watch 的 `size`、触发条件的 `triggerScan`)的进制处理:`HexValueFromJSON`(JSON 看前缀定进制)/ `HexParseInput`(输入框一律 hex)/ `HexDisplay`。**与引擎 `parse_size` 规则必须一致** |
 | `src/NavController.{h,m}` | ~50 | `UINavigationController` 子类,override `navigationBar:shouldPopItem:` 来**拦住系统返回按钮**(UIKit 没有公开的"即将 pop"回调;这依赖 UINavigationController 私下就是自己 navigationBar 的 delegate)。含 `NavPopGuard` 协议 |
-| `src/FormEditVC.{h,m}` | ~120 | 表单编辑页**基类**:快照 / 脏检查 / 「放弃修改?」确认 / 右滑手势开关。TraceEditVC 和 WatchEditVC 都继承它 |
+| `src/FormEditVC.{h,m}` | ~120 | 表单编辑页**基类**:快照 / 脏检查 / 「放弃修改?」确认；编辑页显示期间一律禁用右滑返回。TraceEditVC 和 WatchEditVC 都继承它 |
 | `src/RootListVC.m` | 221 | 主界面。总开关 + 条目列表。点击=编辑,前缘滑=启停,尾缘滑=复制/删除(删除弹确认框),+ 按钮=加trace(先进 AppPicker) |
 | `src/AppPickerVC.m` | 141 | 应用选择器。`LSApplicationWorkspace`(私有 API)列所有 app 图标+名字+bundleId,带搜索 |
-| `src/TraceEditVC.m` | ~680 | trace 表单。**5 段**:App信息/模块地址/选项/触发条件/watches子表(原来的 logMask 多选段已去掉,统一写 17)。触发条件那段的行数按匹配方式伸缩(见 `triggerRows`)。「完成」里带 end-start ≥ 0x10、表达式语法、期望值格式、搜索窗口的校验 |
+| `src/TraceEditVC.m` | ~680 | trace 表单。**5 段**:App信息/模块地址/选项/触发条件/watches子表(trace 次数和原来的 logMask 均已隐藏)。触发条件那段按匹配方式伸缩，并在启用时显示「改为无条件」按钮。「完成」里带 end-start ≥ 0x10、表达式语法、期望值格式、搜索窗口的校验 |
 | `src/WatchEditVC.m` | ~217 | watch 表单。寄存器/action 用 action sheet;寄存器那栏顶部的「✎ 输入取址表达式…」走 `ExprInput` 的弹窗;size 走 `HexValue` |
 | `src/ImportVC.m` | ~110 | **从文件导入**列表页。列 exportDir 里的 .json,点选 → 校验 → 加入 items |
 | `Resources/Info.plist` | - | **必须在 Resources/**,否则图标不出现。bundleId=`com.snk.qbditracer`。含 `UIFileSharingEnabled`+`LSSupportsOpeningDocumentsInPlace`(导出文件供 Finder 文件共享取出) |
@@ -46,7 +46,7 @@
 | `Makefile` | aggregate:`SUBPROJECTS = Engine GUI` |
 | `control` | 包名 `com.snk.qbditracer` |
 | `scripts/build_deps_ios.sh` | 在本地 `third_party/` clone 并编译 QBDI+Dobby(arm64),装进 `Engine/lib`、`Engine/include`。只检查前置工具不自动装。可被 Release 预编译 deps 替代 |
-| `scripts/build_debs.sh` | 一键出 rootful(`iphoneos-arm`)+ rootless(`iphoneos-arm64`)两个 deb。切 scheme 前自动 `make clean`,`--release` 出去符号版 |
+| `scripts/build_debs.sh` | 一键出 rootful(`iphoneos-arm`)+ rootless(`iphoneos-arm64`)两个 deb。两包共用 `YYMMDDHHMM` 版本/文件名；切 scheme 前自动 `make clean`,`--release` 出去符号版 |
 
 ## 常见修改任务
 
@@ -111,6 +111,10 @@
 
 `qbdi_trace.c` 顶部的 `TRACE_LOG_DIR` / `TRACE_LOG_PREFIX`(当前 `/tmp/qbdi_trace_<年月日时分>.log`)。文件名在 `trace_log_open` 里按进程首次写日志的时间用 `strftime("%Y%m%d%H%M")` 生成一次。若想改成"固定文件名"或"每条 trace 一个文件",改这个函数。
 
+运行状态与错误还会通过 `qbdi_console_logf` 写入 iPhone 系统控制台，统一前缀
+`[ios-qbdi-tracer]`。`qbdi_trace_logf` 会同时写文件和控制台；逐指令内容直接写 `FILE *`
+而不进控制台，避免刷屏。新增 hook 生命周期或失败分支时优先走这两个入口。
+
 ## 别踩的坑(血泪)
 
 1. **schema 三处同步**:引擎解析(engine.m)、App 写入(ConfigStore.m newItem)、App 表单(TraceEditVC.m)。字段名对不上 → 配了没效果,还不报错。
@@ -137,12 +141,12 @@
    - `trace_ctx_entry` **任何分支都不能返回 0** —— trampoline 会 `br` 到这个返回值,0 就是跳 NULL 直接崩。拿不到 origin 时退回 `base + start + QBDI_PATCH_SIZE`。
 6. **QBDI 用虚拟栈**:`trace_ctx_entry` 里 QBDI 跑虚拟栈只记录、原生再跑一遍。别改回"真实栈"(会让 QBDI 引擎 abort)。
 7. **地址是偏移不是 VA**:配置里的 start/end/offset 都是相对模块基址,别加 slide。
-8. **改了 UI 但设备上没变化 → 十有八九是没装上新包**,不是代码问题。dpkg/Sileo 在包名相同时经常**不覆盖更新**。验证套路见下面「验证改动是否真的生效」。重装前先 `dpkg -r com.snk.qbditracer` 再装,或升 `control` 里的 Version。
+8. **改了 UI 但设备上没变化 → 十有八九是没装上新包**,不是代码问题。`build_debs.sh` 会用构建时间更新包版本和文件名；手动 `make package` 仍要自行升 Version。验证套路见下面「验证改动是否真的生效」。
 9. **watch 的 `expr` 优先于 `reg`,两者不能都留着**:引擎的规则是"`expr` 编译成功就用 `expr`,否则回落 `reg`"。所以 App 里选寄存器时**必须** `removeObjectForKey:@"expr"`,否则用户先配了表达式、后来改回选寄存器,会表现成"选了却没生效"。反过来,写 `expr` 时会把表达式里的基寄存器同步进 `reg` —— 这是给**旧版引擎**留的退路(它不认识 `expr`,而 `reg` 缺失会让整条 watch 被静默丢弃)。
 10. **`size` 字段带不带 `0x` 语义不同**:`"0x110"` = 272,`"110"` = 110(十进制),NSNumber `272` = 272。旧配置是裸十进制,新 App 写出来一律带 `0x`,靠前缀区分、不用迁移。但**输入框里**一律按十六进制理解(敲 `10` 存成 `"0x10"` = 16)—— 因为框里显示的永远是带 `0x` 的规范形式,用户不会在 UI 里看到裸十进制。引擎侧千万别用 `parse_int`(它是 `strtol(s, NULL, 0)`,`"010"` 会被当八进制),用专门的 `parse_size`。
 11. **trace 区间必须 ≥ 0x10 字节**:`end - start < 0x10` 时 end 落在 Dobby 补丁区内,QBDI 永远跑不到它 → 一路执行到 SIGSEGV(原因见 DESIGN.md §4.3.1)。三处都挡了:`engine.m` 加载、`qbdi_trace.c` 的 `trace()`、GUI 的「完成」。**改这个下限要同时改 4 个地方**:`qbdi_trace.h` 的 `QBDI_PATCH_SIZE`、上面两处校验、`TraceEditVC.m` 的 `TRACE_MIN_RANGE`。
 12. **编辑页的快照必须在字段规范化之后拍**:`size` 会被规范成 `"0x..."`、`count`/`delaySecs` 会从字符串变 NSNumber、`logMask` 会被写成 17 —— 这些都不是用户的编辑动作。顺序反了的话,进表单什么都不动、一返回就误弹「放弃修改」。两个 VC 都在 `viewDidLoad` 里先规范化再 `beginEditingTarget:`。
-13. **右滑返回绕过 `navShouldPop`**:它由 `interactivePopGestureRecognizer` 驱动,不经过 `navigationBar:shouldPopItem:`。所以 `FormEditVC` 在有改动时直接把那个手势关掉,并且**必须在 `viewWillDisappear` 恢复**(不恢复会把禁用状态带给后面的页面)。
+13. **右滑返回绕过 `navShouldPop`**:它由 `interactivePopGestureRecognizer` 驱动,不经过 `navigationBar:shouldPopItem:`；字段未失焦时脏检查也看不到新值。所以 `FormEditVC` 在编辑页显示期间始终关闭手势，并且**必须在 `viewWillDisappear` 恢复**(不恢复会把禁用状态带给后面的页面)。
 14. **触发条件配错会拒掉整条 trace**,不是退化成"无条件"。这是故意的:过滤静默失效会给一堆本该被滤掉的日志,而你以为条件在生效。日志里会写 `skip item (slot N): bad trigger: ...`。
 15. **`bytes` 和 `u64` 的字节序是反的**:`bytes` 按内存顺序(和 hexdump 看到的一致),`u64` 是小端整数。同一块内存 `08 a4 8c 90 81 04 10 02`,前者写 `08a48c9081041002`,后者写 `0x02100481908ca408`。界面 footer 里有提示,改那段文案时别改错。
 16. **触发条件的「字符串」不是 watch 的 `cstr`**:watch 的 `cstr` 是"读到 `\0` 然后打印出来";触发条件的「字符串」是拿期望值去比较。而且**用「字符串」填十六进制是常见误用** —— 填 `08a48c90` 会拿 ASCII 文本 `"08a48c90"`(`30 38 61 34…`)去比二进制 `08 a4 8c 90`,永远不匹配。二进制数据要用「字节」。
@@ -237,16 +241,17 @@ GUI 校验与引擎 parser 的判断、size 两侧的进制解析都交叉比对
 15. size:旧配置(裸十进制 `272`)打开表单显示 `0x110`,保存后 json 里变成 `"0x110"`,
     **实际截断长度没变**(仍是 272 字节)
 
-### 区间校验 / logMask 隐藏 / 返回确认(本次新增)
+### 区间校验 / 选项隐藏 / 返回确认
 
 16. 配一条 `end - start < 0x10` 的规则 →「完成」被挡下并提示;手工写进 json 的话,
     目标 app 启动后日志出现 `[engine] skip item ... range too short`,且**不会**再跑飞到 SIGSEGV
 17. logMask 那一段在界面上没了;打开一条旧规则(json 里 `logMask: 1`)点「完成」,
     json 里变成 `17`,重开目标 app 后日志里出现 `V{...}` 向量寄存器行
+    - trace 次数也不再显示；新规则仍默认 `count=1`，旧 JSON 的值继续兼容
 18. **返回拦截**(三个入口都要试):
     - 编辑 Trace 改一个字段 → 点左上角 `< QBDI Tracer` → 弹「放弃修改?」;选「放弃」字段回到原值,选「继续编辑」留在原页
     - 编辑监视改一个字段 → 点左上角 `< 编辑 Trace` → 同上
-    - 有改动时右滑返回**无反应**;没改动时右滑能正常返回
+    - 不论是否已有改动，两个编辑页右滑返回都应**无反应**
 19. `shouldPopItem:` 返回 NO 之后,左上角返回按钮**没有卡在半透明状态**(NavController 里手动淡回来了)
 20. 在监视页点「确定」→ 回到 Trace 页 → 点「放弃」→ watch 的改动**仍然保留**(这是刻意的)
 21. 新建 trace 填了一半点返回 → 弹确认 → 放弃后回到 AppPicker,列表里没有多出条目
@@ -254,12 +259,12 @@ GUI 校验与引擎 parser 的判断、size 两侧的进制解析都交叉比对
 ### 触发条件(本次新增)
 
 22. 「触发条件」段留空时只有一行、显示"无条件",行为与以前完全一致
-23. 配 `triggerExpr` + 匹配方式「非空」→ 那些 `[x2+0x10]=0x0 (null)` 的调用**在日志里完全消失**,
-    每挡掉 100 次出现一行 `trigger: filtered 100 calls (total N)`
+23. 配 `triggerExpr` + 匹配方式「非空」→ 那些 `[x2+0x10]=0x0 (null)` 的调用不产生逐指令/watch 内容；
+    第 1/10/100/1000… 次只输出一条 `trigger miss` 诊断到文件和系统控制台
 24. 配「字节」+ `08a48c90` → 只有内存以这 4 个字节开头的那次被 trace,
     命中前一行 `trigger matched after N filtered calls`
 25. **count 不被浪费**:`count=1` + 条件,连续调用几百次后仍能抓到第一次真正匹配的那次
-26. 左滑「取址表达式」那行 → 「清除条件」→ 回到无条件
+26. 点触发条件段底部红色「改为无条件」→ 回到无条件；左滑「取址表达式」的旧入口也保留
 27. 期望值写坏(奇数个 hex、非 hex 字符、超 32 字节)→「完成」被挡下并提示;
     手工写进 json 的话,日志出现 `bad trigger:` 且该条 trace **不装 hook**
 28. 「字节」和「u64」对同一块内存分别按内存顺序/小端写,都能命中同一次调用

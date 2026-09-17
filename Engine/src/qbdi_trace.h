@@ -55,5 +55,8 @@ extern __thread void *g_enter_origin;
 /* 追加日志(自动 hook 的安装/报错信息) */
 void qbdi_trace_logf(const char *fmt, ...);
 
+/* 只写 iPhone 系统日志控制台，自动加 [ios-qbdi-tracer] 前缀。 */
+void qbdi_console_logf(const char *fmt, ...);
+
 /* 安装崩溃信号捕获(SIGSEGV/SIGBUS/SIGILL/SIGABRT),把崩溃 PC 写进日志后重抛 */
 void qbdi_trace_crash_diag_init(void);

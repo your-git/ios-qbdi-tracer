@@ -219,8 +219,8 @@
     NSString *app = [it[@"appName"] length] ? it[@"appName"] : it[@"bundleId"];
     cell.textLabel.text = [NSString stringWithFormat:@"%@  %@",
                            app ?: @"?", it[@"module"] ?: @""];
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ - %@  x%@",
-                                 it[@"start"], it[@"end"], it[@"count"]];
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ - %@",
+                                  it[@"start"], it[@"end"]];
     cell.accessoryType = [it[@"enabled"] boolValue]
                              ? UITableViewCellAccessoryCheckmark
                              : UITableViewCellAccessoryNone;

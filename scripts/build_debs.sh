@@ -29,28 +29,47 @@ if [ "$1" = "--release" ] || [ "$1" = "-r" ]; then
     echo "== 发布模式(去符号)=="
 fi
 
+# 同一次构建的 rootful/rootless 包共用一个时间版本。既作为 deb 内部版本传给
+# Theos，也在构建后统一规范文件名，避免固定 0.1-1 导致新包看不出来、安装不覆盖。
+BUILD_VERSION="$(date +%y%m%d%H%M)"
+PACKAGE_ID="com.snk.qbditracer"
+
 # 切换 scheme 必须 make clean,否则会混用上次的中间产物 → 装上行为诡异
 build_one() {
-    scheme="$1"; label="$2"
+    scheme="$1"; label="$2"; arch="$3"
     echo
     echo "==================== 构建 $label 版 ===================="
     make clean >/dev/null 2>&1 || true
     if [ "$scheme" = "rootless" ]; then
-        THEOS_PACKAGE_SCHEME=rootless make package $FINAL
+        THEOS_PACKAGE_SCHEME=rootless make package \
+            PACKAGE_VERSION="$BUILD_VERSION" $FINAL
     else
         # 显式清空,避免继承外部环境里残留的 rootless 设置
-        env -u THEOS_PACKAGE_SCHEME make package $FINAL
+        env -u THEOS_PACKAGE_SCHEME make package \
+            PACKAGE_VERSION="$BUILD_VERSION" $FINAL
     fi
+
+
+    # 即使某个 Theos 版本给文件名追加了调试后缀，也在这里统一规范成时间戳文件名。
+    built="$(ls -t packages/*_"$arch".deb 2>/dev/null | head -1)"
+    if [ -z "$built" ]; then
+        echo "❌ 构建完成但没有找到 $arch deb"
+        exit 1
+    fi
+    dest="packages/${PACKAGE_ID}_${BUILD_VERSION}_${arch}.deb"
+    if [ "$built" != "$dest" ]; then
+        mv -f "$built" "$dest"
+    fi
+    echo "→ $dest"
 }
 
-build_one rootful  "rootful (iphoneos-arm)"
-build_one rootless "rootless (iphoneos-arm64)"
+build_one rootful  "rootful (iphoneos-arm)"     "iphoneos-arm"
+build_one rootless "rootless (iphoneos-arm64)" "iphoneos-arm64"
 
 echo
 echo "✅ 完成。产出的 deb:"
-ls -t packages/*.deb 2>/dev/null | head -2 | while read -r f; do
-    echo "   $f"
-done
+echo "   packages/${PACKAGE_ID}_${BUILD_VERSION}_iphoneos-arm.deb"
+echo "   packages/${PACKAGE_ID}_${BUILD_VERSION}_iphoneos-arm64.deb"
 echo
 echo "分发说明:"
 echo "  传统越狱(rootful)  → 装 *_iphoneos-arm.deb"

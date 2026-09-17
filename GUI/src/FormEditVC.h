@@ -12,7 +12,7 @@
  *   1. 先把字段规范化好(比如 size 转成 "0x..."、logMask 写成默认值),再调
  *      beginEditingTarget: —— 顺序反了会把自动规范化当成"用户改了东西"而误弹确认框
  *   2. 有不参与回滚的子结构时覆盖 snapshotExcludedKeys
- *   3. 每个写入点之后调 updatePopGesture(让右滑在变脏后失效)
+ *   3. 编辑页显示期间由基类统一禁用右滑返回
  */
 @interface FormEditVC : UITableViewController <NavPopGuard>
 
@@ -28,7 +28,7 @@
 /* 当前内容与快照是否不同(不含 snapshotExcludedKeys) */
 - (BOOL)hasChanges;
 
-/* 有改动时关掉右滑返回(它绕过 navShouldPop),无改动时放开 */
+/* 编辑页显示期间关闭右滑返回(它会绕过 navShouldPop) */
 - (void)updatePopGesture;
 
 @end

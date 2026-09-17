@@ -75,13 +75,22 @@
 }
 
 - (void)updatePopGesture {
-    /* 右滑返回绕过 navShouldPop,有改动时只能整个关掉 */
-    self.navigationController.interactivePopGestureRecognizer.enabled =
-        ![self hasChanges];
+    /* 右滑返回完全绕过 navigationBar:shouldPopItem:。字段正在输入、尚未失焦时，
+     * 字典里的值还没有回写，单靠 hasChanges 判断会误以为页面是干净的，从而让手势
+     * 直接把页面划走。编辑页显示期间一律关闭右滑，统一走左上角返回和放弃确认。 */
+    if (self.navigationController.topViewController == self) {
+        self.navigationController.interactivePopGestureRecognizer.enabled = NO;
+    }
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    [self updatePopGesture];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    /* UIKit 在转场完成时可能重置交互返回手势，再关一次确保状态稳定。 */
     [self updatePopGesture];
 }
 

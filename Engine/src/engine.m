@@ -282,6 +282,10 @@ static void load_watches(NSArray *warr) {
             }
         }
         if (dst->module == NULL || (dst->reg == NULL && dst->expr == NULL)) {
+            qbdi_trace_logf("[watch] skipped invalid entry: module=%s reg=%s expr=%s\n",
+                            dst->module ? dst->module : "(null)",
+                            dst->reg ? dst->reg : "(null)",
+                            dst->expr ? dst->expr : "(null)");
             continue; /* 丢弃无效行,不递增 count */
         }
         g_watch_count++;
@@ -291,6 +295,9 @@ static void load_watches(NSArray *warr) {
 /* 对一个槽位装 Dobby hook(在该条目的延迟到点后调用) */
 static void install_slot(int slot) {
     TraceSpec *t = &g_traces[slot];
+    qbdi_trace_logf("[engine] installing hook: slot=%d target=%s+0x%llx\n",
+                    slot, t->module ? t->module : "(null)",
+                    (unsigned long long)t->static_start);
     uint64_t base = 0;
     if (!find_module(t->module, &base)) {
         qbdi_trace_logf("[engine] module not found: %s (slot %d)\n", t->module, slot);
@@ -321,14 +328,24 @@ void engine_start(void) {
             return;
         }
 
+        NSString *processName = [[NSProcessInfo processInfo] processName];
+        qbdi_console_logf("engine loaded: app=%s bundle=%s pid=%d",
+                          processName.UTF8String ?: "(unknown)",
+                          bundleId.UTF8String ?: "(unknown)",
+                          [[NSProcessInfo processInfo] processIdentifier]);
+
         NSString *path = config_path();
         NSData *data = [NSData dataWithContentsOfFile:path];
         if (data == nil) {
             return; /* 无配置:空转返回(全量注入的其它 app 走这里) */
         }
+        NSError *jsonError = nil;
         NSDictionary *cfg =
-            [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
         if (![cfg isKindOfClass:[NSDictionary class]]) {
+            qbdi_console_logf("config load failed: path=%s error=%s",
+                              path.UTF8String,
+                              jsonError.localizedDescription.UTF8String ?: "invalid root object");
             return;
         }
         if (!parse_bool(cfg[@"enabled"], true)) {
@@ -379,7 +396,7 @@ void engine_start(void) {
 
         /* 崩溃捕获立即装(延迟期间崩溃也留档) */
         qbdi_trace_crash_diag_init();
-        qbdi_trace_logf("[engine] %s: %lu matched item(s)\n",
+        qbdi_trace_logf("[engine] app started, begin injection: %s, %lu matched item(s)\n",
                         [bundleId UTF8String], (unsigned long)matched.count);
 
         for (NSDictionary *it in matched) {
@@ -436,6 +453,8 @@ void engine_start(void) {
         }
 
         if (g_trace_count == 0) {
+            qbdi_trace_logf("[engine] injection aborted: no valid trace items for %s\n",
+                            [bundleId UTF8String]);
             return;
         }
         qbdi_trace_init_state(); /* 按 g_trace_count 重置 origin/remaining */

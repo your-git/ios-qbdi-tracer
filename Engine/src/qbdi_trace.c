@@ -6,6 +6,7 @@
 #include <mach/mach.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <os/log.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -31,6 +32,7 @@
 #define WATCH_HEXDUMP_MAX 0x10000
 /* Dobby 搬走的原函数序言代码范围:覆盖 origin trampoline 里被搬迁的那几条指令 */
 #define ORIGIN_SPAN 0x40
+#define CONSOLE_PREFIX "[ios-qbdi-tracer]"
 
 /* 手动路径的入参(线程局部) */
 __thread uint64_t g_enter_args[8];
@@ -90,6 +92,25 @@ static void trace_lock_init(void) {
 static pthread_once_t g_trace_lock_once = PTHREAD_ONCE_INIT;
 #define trace_lock_ensure() pthread_once(&g_trace_lock_once, trace_lock_init)
 
+/* 系统控制台只承载运行状态和故障诊断，不镜像逐指令输出，避免把 Console 刷爆。 */
+static void console_vlogf(const char *fmt, va_list ap) {
+    char msg[2048];
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    size_t n = strlen(msg);
+    while (n > 0 && (msg[n - 1] == '\n' || msg[n - 1] == '\r')) {
+        msg[--n] = '\0';
+    }
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "%{public}s %{public}s",
+                     CONSOLE_PREFIX, msg);
+}
+
+void qbdi_console_logf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    console_vlogf(fmt, ap);
+    va_end(ap);
+}
+
 static FILE *trace_log_open(void) {
     if (g_log == NULL) {
         char path[256];
@@ -102,6 +123,11 @@ static FILE *trace_log_open(void) {
         snprintf(path, sizeof(path), "%s/%s%s.log", TRACE_LOG_DIR,
                  TRACE_LOG_PREFIX, ts);
         g_log = fopen(path, "a");
+        if (g_log != NULL) {
+            qbdi_console_logf("trace log opened: %s", path);
+        } else {
+            qbdi_console_logf("trace log open FAILED: %s", path);
+        }
     }
     return g_log;
 }
@@ -198,7 +224,7 @@ static size_t watch_read_string(uint64_t addr, unsigned char *buf, size_t cap) {
     return len;
 }
 
-static void watch_dump_hex(FILE *out, uint64_t addr, uint32_t size) {
+static bool watch_dump_hex(FILE *out, uint64_t addr, uint32_t size) {
     unsigned char buf[256];
     size_t total = size ? size : 64;
     bool truncated = false;
@@ -218,7 +244,7 @@ static void watch_dump_hex(FILE *out, uint64_t addr, uint32_t size) {
                 fprintf(out, "(not a pointer)");
             }
             fputc('\n', out);
-            return;
+            return false;
         }
         /* 行首打绝对地址:起点可能是 x0-0x110 这种,相对偏移看不出自己在哪 */
         for (size_t i = 0; i < got; i += 16) {
@@ -246,25 +272,26 @@ static void watch_dump_hex(FILE *out, uint64_t addr, uint32_t size) {
     if (truncated) {
         fprintf(out, "    ... (truncated at 0x%x bytes)\n", WATCH_HEXDUMP_MAX);
     }
+    return true;
 }
 
 /* objc/po:把 val 当 ObjC 对象解析。先粗校验 isa 降低野指针风险。 */
-static void watch_handle_objc(FILE *out, uint64_t val) {
+static bool watch_handle_objc(FILE *out, uint64_t val) {
     uint64_t isa = 0;
     if (safe_read(val, &isa, sizeof(isa)) != sizeof(isa)) {
         fprintf(out, " (not an ObjC object)\n");
-        return;
+        return false;
     }
     uint64_t probe = 0;
     if (safe_read(isa, &probe, sizeof(probe)) != sizeof(probe)) {
         fprintf(out, " (not an ObjC object)\n");
-        return;
+        return false;
     }
     id obj = (id)(uintptr_t)val;
     Class cls = object_getClass(obj);
     if (cls == NULL) {
         fprintf(out, " (not an ObjC object)\n");
-        return;
+        return false;
     }
 
     SEL isKind = sel_registerName("isKindOfClass:");
@@ -299,6 +326,7 @@ static void watch_handle_objc(FILE *out, uint64_t val) {
                              : NULL;
         fprintf(out, " %s\n", s ? s : "(nil)");
     }
+    return true;
 }
 
 /* 把 QBDI 的 GPRState 摊成 watch 表达式用的寄存器数组(下标见 watch_expr.h) */
@@ -338,15 +366,22 @@ static int watch_handle(FILE *out, const GPRState *gpr, const char *module,
                 /* 多级指针配错时,光说"读不出来"没法排查 —— 把每一级都列出来 */
                 fprintf(out, "%s = <unreadable>\n", disp);
                 wexpr_print_trace(out, &tr);
+                qbdi_console_logf("watch failed: %s+0x%llx %s unreadable",
+                                  module, (unsigned long long)w->offset, disp);
                 continue;
             }
         } else if (!watch_reg_value(gpr, w->reg, &val)) {
             fprintf(out, "%s = <absent>\n", disp ? disp : "(none)");
+            qbdi_console_logf("watch failed: %s+0x%llx register %s absent",
+                              module, (unsigned long long)w->offset,
+                              disp ? disp : "(none)");
             continue;
         }
         fprintf(out, "%s=0x%llx", disp, (unsigned long long)val);
         if (val == 0) {
             fprintf(out, " (null)\n");
+            qbdi_console_logf("watch returned null: %s+0x%llx %s",
+                              module, (unsigned long long)w->offset, disp);
             continue;
         }
 
@@ -364,6 +399,10 @@ static int watch_handle(FILE *out, const GPRState *gpr, const char *module,
                     fputs(" \"\"\n", out);
                 } else {
                     fputs(" (not a pointer)\n", out);
+                    qbdi_console_logf(
+                        "watch failed: %s+0x%llx %s=0x%llx is not readable",
+                        module, (unsigned long long)w->offset, disp,
+                        (unsigned long long)val);
                 }
             } else {
                 fputc(' ', out);
@@ -376,6 +415,10 @@ static int watch_handle(FILE *out, const GPRState *gpr, const char *module,
                 fprintf(out, " = 0x%08x\n", v);
             } else {
                 fputs(" (not a pointer)\n", out);
+                qbdi_console_logf(
+                    "watch failed: %s+0x%llx %s=0x%llx cannot read u32",
+                    module, (unsigned long long)w->offset, disp,
+                    (unsigned long long)val);
             }
         } else if (strcmp(a, "u64") == 0) {
             uint64_t v = 0;
@@ -383,12 +426,26 @@ static int watch_handle(FILE *out, const GPRState *gpr, const char *module,
                 fprintf(out, " = 0x%llx\n", (unsigned long long)v);
             } else {
                 fputs(" (not a pointer)\n", out);
+                qbdi_console_logf(
+                    "watch failed: %s+0x%llx %s=0x%llx cannot read u64",
+                    module, (unsigned long long)w->offset, disp,
+                    (unsigned long long)val);
             }
         } else if (strcmp(a, "hexdump") == 0) {
             fputc('\n', out);
-            watch_dump_hex(out, val, w->size);
+            if (!watch_dump_hex(out, val, w->size)) {
+                qbdi_console_logf(
+                    "watch failed: %s+0x%llx %s=0x%llx cannot hexdump",
+                    module, (unsigned long long)w->offset, disp,
+                    (unsigned long long)val);
+            }
         } else if (strcmp(a, "objc") == 0 || strcmp(a, "po") == 0) {
-            watch_handle_objc(out, val);
+            if (!watch_handle_objc(out, val)) {
+                qbdi_console_logf(
+                    "watch failed: %s+0x%llx %s=0x%llx is not an ObjC object",
+                    module, (unsigned long long)w->offset, disp,
+                    (unsigned long long)val);
+            }
         } else {
             /* 未知 action:只打印寄存器值 */
             fputc('\n', out);
@@ -563,6 +620,23 @@ static void trigger_log_miss(const TraceSpec *spec, const TrigProbe *probe,
                              uint64_t nth, const TraceRegFile *rf) {
     const char *where =
         spec->trigger_where == TRIG_AT_CONTAINS ? "contains" : "prefix";
+
+    if (!probe->addr_ok) {
+        qbdi_console_logf("[%s] trigger miss #%llu: %s unreadable",
+                          spec->module, (unsigned long long)nth,
+                          spec->trigger_expr);
+    } else if (probe->addr == 0) {
+        qbdi_console_logf("[%s] trigger miss #%llu: %s returned null",
+                          spec->module, (unsigned long long)nth,
+                          spec->trigger_expr);
+    } else if (!probe->read_ok) {
+        qbdi_console_logf("[%s] trigger miss #%llu: read failed at 0x%llx",
+                          spec->module, (unsigned long long)nth,
+                          (unsigned long long)probe->addr);
+    } else {
+        qbdi_console_logf("[%s] trigger miss #%llu: content did not match (%s)",
+                          spec->module, (unsigned long long)nth, where);
+    }
 
     /* 整段在一次加锁里写完:多线程同时命中时,want/got 这几行不能被别人插进来。
      * (递归锁,内部再调 qbdi_trace_logf 也安全) */
@@ -792,17 +866,22 @@ static VMAction inst_cb(VMInstanceRef vm, GPRState *gpr, FPRState *fpr,
 }
 
 void qbdi_trace_logf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list console_ap;
+    va_copy(console_ap, ap);
+    console_vlogf(fmt, console_ap);
+    va_end(console_ap);
+
     trace_lock_ensure();
     pthread_mutex_lock(&g_trace_lock);
     FILE *out = trace_log_open();
     if (out != NULL) {
-        va_list ap;
-        va_start(ap, fmt);
         vfprintf(out, fmt, ap);
-        va_end(ap);
         fflush(out);
     }
     pthread_mutex_unlock(&g_trace_lock);
+    va_end(ap);
 }
 
 /* ---- 崩溃诊断:捕获 SIGSEGV/BUS/ILL/ABRT,记录 PC/寄存器后重抛 ----
@@ -926,12 +1005,11 @@ static uint64_t run_trace(const TraceSpec *spec, uint64_t base, void *origin,
     state->x29 = rf->fp;
     state->lr = end;
 
-    fprintf(out,
-            "[%s] ==== trace#%d enter %s+0x%llx -> %s+0x%llx entry=%p scope=%s ====\n",
-            spec->module, no, spec->module, (unsigned long long)spec->static_start,
-            spec->module, (unsigned long long)spec->static_end,
-            (void *)(uintptr_t)entry, spec->module_only ? "module" : "all");
-    fflush(out);
+    qbdi_trace_logf(
+        "[%s] ==== trace#%d enter %s+0x%llx -> %s+0x%llx entry=%p scope=%s ====\n",
+        spec->module, no, spec->module, (unsigned long long)spec->static_start,
+        spec->module, (unsigned long long)spec->static_end,
+        (void *)(uintptr_t)entry, spec->module_only ? "module" : "all");
 
     qbdi_trace_logf("[%s] trace#%d step: qbdi_run\n", spec->module, no);
     bool ok = qbdi_run(vm, entry, end);
@@ -946,10 +1024,13 @@ static uint64_t run_trace(const TraceSpec *spec, uint64_t base, void *origin,
     }
     uint64_t ret = state->x0;
 
-    fprintf(out, "[%s] ==== trace#%d exit ret=0x%llx inst=%llu ok=%d ====\n",
-            spec->module, no, (unsigned long long)ret,
-            (unsigned long long)ctx.inst_count, ok);
-    fflush(out);
+    qbdi_trace_logf("[%s] ==== trace#%d exit ret=0x%llx inst=%llu ok=%d ====\n",
+                    spec->module, no, (unsigned long long)ret,
+                    (unsigned long long)ctx.inst_count, ok);
+    if (!ok) {
+        qbdi_console_logf("[%s] trace#%d FAILED: qbdi_run returned false",
+                          spec->module, no);
+    }
 
     if (fakestack != NULL) {
         qbdi_alignedFree(fakestack);
@@ -969,14 +1050,24 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx) {
     /* 出任何意外都不能返回 0:trampoline 会 br 到它,0 = 跳 NULL 直接崩。
      * 没有 origin 可跳时,退回"补丁之后"继续执行原函数。 */
     if (idx < 0 || idx >= g_trace_count) {
-        return origin != NULL ? (uint64_t)(uintptr_t)origin : 0;
+        qbdi_trace_logf("[engine] return failed: invalid slot %d (trace count %d, origin=%p)\n",
+                        idx, g_trace_count, origin);
+        return origin != NULL ? (uint64_t)(uintptr_t)origin
+                              : (rf != NULL ? rf->lr : 0);
     }
     const TraceSpec *spec = &g_traces[idx];
     uint64_t base = g_module_base[idx]; /* 装 hook 时算好的,不变 */
     if (spec->module == NULL || base == 0) {
-        return origin != NULL ? (uint64_t)(uintptr_t)origin : 0;
+        qbdi_trace_logf("[engine] return failed: slot %d has module=%s base=0x%llx origin=%p\n",
+                        idx, spec->module ? spec->module : "(null)",
+                        (unsigned long long)base, origin);
+        return origin != NULL ? (uint64_t)(uintptr_t)origin
+                              : (rf != NULL ? rf->lr : 0);
     }
     if (origin == NULL) {
+        qbdi_trace_logf("[engine] return fallback: slot %d origin missing, continue at %s+0x%llx\n",
+                        idx, spec->module,
+                        (unsigned long long)(spec->static_start + QBDI_PATCH_SIZE));
         return base + spec->static_start + QBDI_PATCH_SIZE;
     }
 

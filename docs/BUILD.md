@@ -57,9 +57,11 @@ export THEOS=/Users/tk/Documents/tools/theos
 ./scripts/build_debs.sh --release  # 发布版(去符号)
 ```
 
-脚本会依次构建两种架构的 deb 各一个:
-- `packages/com.snk.qbditracer_***_iphoneos-arm.deb`   —— **rootful**(传统越狱)
-- `packages/com.snk.qbditracer_***_iphoneos-arm64.deb` —— **rootless**(Dopamine / palera1n)
+脚本会用同一个 `YYMMDDHHMM` 构建时间作为包版本，依次构建两种架构的 deb 各一个:
+- `packages/com.snk.qbditracer_年月日时分_iphoneos-arm.deb`   —— **rootful**(传统越狱)
+- `packages/com.snk.qbditracer_年月日时分_iphoneos-arm64.deb` —— **rootless**(Dopamine / palera1n)
+
+例如 `2026-09-16 13:52` 会生成版本 `2609161352`。
 
 > ⚠️ **rootful / rootless 装错会报架构不匹配**(`package architecture ... does not match system`)。
 > 两种越狱怎么区分、装哪个包,见 [README 的"装哪个包"章节](../README.md#-装哪个包rootful--rootless-别装错)。
