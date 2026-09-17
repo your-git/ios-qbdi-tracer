@@ -1,7 +1,19 @@
 #include <stdint.h>
 
+#include <dobby.h>
+
 #include "config.h"
 #include "qbdi_trace.h"
+
+/* trampoline 的最终间接跳转必须占用一个通用寄存器。Dobby 在 arm64 上明确把
+ * x17 保留为跳板临时寄存器，因此只能牺牲 x17；x16 仍属于 hook 点原始状态，
+ * 必须恢复。若将来升级 Dobby 后契约变化，宁可编译失败，也不能静默跳错地址。 */
+#ifndef ARM64_TMP_REG_NDX_0
+#error "Dobby arm64 temporary-register contract is unavailable"
+#endif
+#if ARM64_TMP_REG_NDX_0 != 17
+#error "Tracer trampoline requires Dobby ARM64_TMP_REG_NDX_0 to be x17"
+#endif
 
 /*
  * 固定 32 个 naked arm64 trampoline(槽位 0..31)。
@@ -12,7 +24,8 @@
  *
  * DobbyHook 是**纯跳转** hook,不替我们保存任何 CPU 状态;而 hook 点通常落在
  * **函数中间**,不是函数调用边界 —— 也就是说这里没有任何 ABI 保护可言,原代码
- * 此刻持有的一切都得原样还回去。所以除了通用寄存器,还必须保存:
+ * 此刻持有的一切都得原样还回去。唯一例外是 Dobby 已声明为跳板临时寄存器的
+ * x17：入口补丁本身就可能改写它，返回时继续用它承载 origin。除此之外还必须保存:
  *
  *   NZCV  —— 条件标志位。trace_ctx_entry 里的 C 代码(表达式求值、memcmp、
  *            字符串搜索)一定会改写它。不恢复的话,原代码紧跟着的 b.eq/cbz 之类
@@ -32,6 +45,8 @@
  *
  * 恢复顺序有讲究:`msr nzcv` 必须排在恢复通用寄存器**之前**(借 x9 当临时寄存器),
  * 因为之后的 ldp/ldr/mov sp/br 都不会碰标志位,而 x9 随后会被还原成原值。
+ * `trace_ctx_entry` 的返回值必须留在 x17 直到最后 `br x17`；绝不能先放进 x16
+ * 又用保存值覆盖 x16，否则会跳到 hook 入口时的旧 x16，造成重复进入同一现场。
  */
 #define TRAMP(slot)                                                             \
     __attribute__((naked)) static void tramp_##slot(void) {                     \
@@ -81,7 +96,12 @@
             "mov x0, sp\n"                                                       \
             "mov x1, #" #slot "\n"                                               \
             "bl _trace_ctx_entry\n"                                              \
-            "mov x16, x0\n"                                                      \
+            /* x17 是 Dobby 的 arm64 跳板临时寄存器。若 C 层意外返回 0，退到 */    \
+            /* hook 现场保存的 LR，至少避免 br 0 立即崩溃。 */                     \
+            "mov x17, x0\n"                                                      \
+            "cbnz x17, 1f\n"                                                     \
+            "ldr x17, [sp, #0xf0]\n"                                             \
+            "1:\n"                                                               \
             "ldp q0, q1, [sp, #0x120]\n"                                         \
             "ldp q2, q3, [sp, #0x140]\n"                                         \
             "ldp q4, q5, [sp, #0x160]\n"                                         \
@@ -113,7 +133,8 @@
             "ldp x10, x11, [sp, #0x50]\n"                                        \
             "ldp x12, x13, [sp, #0x60]\n"                                        \
             "ldp x14, x15, [sp, #0x70]\n"                                        \
-            "ldp x16, x17, [sp, #0x80]\n"                                        \
+            /* x16 必须恢复；x17 保留 trace_ctx_entry 返回的续跑地址。 */           \
+            "ldr x16, [sp, #0x80]\n"                                             \
             "ldp x18, x19, [sp, #0x90]\n"                                        \
             "ldp x20, x21, [sp, #0xa0]\n"                                        \
             "ldp x22, x23, [sp, #0xb0]\n"                                        \
@@ -123,7 +144,7 @@
             "ldr x30, [sp, #0xf0]\n"                                             \
             "ldr x9, [sp, #0xf8]\n"                                              \
             "mov sp, x9\n"                                                       \
-            "br x16\n"                                                           \
+            "br x17\n"                                                           \
         );                                                                       \
     }
 

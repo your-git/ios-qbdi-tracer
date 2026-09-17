@@ -59,8 +59,14 @@ iOS 指令级 tracer:**运行期 JSON 配置 + 手机 UI 管理**,改配置不�
 ```
 保存 x0-x28 / fp / lr / 真实sp / NZCV / FPCR / FPSR / q0-q31 到栈
   →  bl trace_ctx_entry(rf, slot)
-  →  原样恢复上面所有东西(sp 用真实sp)  →  br 续跑地址
+  →  恢复全部应用状态(x17 除外)  →  x17 持有续跑地址  →  br x17
 ```
+
+`x17` 是 Dobby 在 arm64 上声明的跳板临时寄存器，入口补丁本身就可能改写它；
+trampoline 因而用 x17 承载 `trace_ctx_entry` 返回的 origin，并恢复 x16。源码有
+`ARM64_TMP_REG_NDX_0 == 17` 的编译期检查，Dobby 契约变化时会直接拒绝构建。
+曾经把返回值放进 x16、随后又用保存现场覆盖 x16，最终 `br x16` 跳回旧地址，表现为
+同一个 hook 现场和寄存器值无限重复。
 
 **为什么要存这么多**:`DobbyHook` 是纯跳转 hook,不替我们保存任何 CPU 状态;而 hook 点落在
 **函数中间**,不是函数调用边界 —— 这里没有任何 ABI 保护,原代码此刻持有的一切都得原样还回去。

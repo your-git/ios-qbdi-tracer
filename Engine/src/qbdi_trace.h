@@ -24,7 +24,7 @@ enum {
 
 /* hook 点的完整 GPR 上下文(asm trampoline 捕获/恢复) */
 typedef struct {
-    uint64_t x[29]; /* x0..x28 */
+    uint64_t x[29]; /* x0..x28；x17 可能已被 Dobby 入口跳板占用，不能视为可靠原值 */
     uint64_t fp;    /* x29 */
     uint64_t lr;    /* x30 */
     uint64_t sp;    /* 真实 sp(asm 在入栈前记下) */

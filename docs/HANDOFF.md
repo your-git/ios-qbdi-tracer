@@ -10,7 +10,7 @@
 |---|---|---|---|
 | `Tweak.x` | 小 | 入口。`__attribute__((constructor))` → `engine_start()`。**不用 Logos %ctor**(Apple clang 21+ 编不过其 `__unused` 参数) | 几乎不改 |
 | `src/engine.m` | 236 | **核心新代码**。读 JSON、匹配 bundleId、填 `g_traces`/`g_watches`、每条目 dispatch_after 延迟装 Dobby hook。也定义了 `g_traces/g_watches/g_trace_count/g_watch_count` 和 `find_module` | 加字段/改匹配逻辑时 |
-| `src/tramp.c` | ~150 | 固定 32 个 naked arm64 trampoline + `g_tramps[]` 指针表。保存/恢复 **x0-x30 + 真实sp + NZCV + FPCR/FPSR + q0-q31**(栈帧 `0x320`)。少存任何一样都会破坏原代码状态 —— NZCV 尤其致命 | **改完必须反汇编核对** |
+| `src/tramp.c` | ~150 | 固定 32 个 naked arm64 trampoline + `g_tramps[]` 指针表。保存完整现场并恢复除 Dobby 临时寄存器 x17 外的状态；x17 专门承载 origin，最终 `br x17`(栈帧 `0x320`)。少存任何一样或覆盖续跑地址都会破坏控制流 | **改完必须反汇编核对** |
 | `src/qbdi_trace.c` | 680 | QBDI 引擎:VM 记录、`trace_ctx_entry`(记录后原生续跑)、`watch_handle`、崩溃捕获 | 改 trace/watch 行为时 |
 | `src/qbdi_trace.h` | 55 | LOG_* 位、`TRACE_MAX_TARGETS=32`/`TRACE_MAX_WATCHES=128`、`TraceRegFile`、函数声明 | 改上限时 |
 | `src/watch_expr.{h,c}` | ~420 | **watch 取址表达式**(`x0-0x110`、`[[x0+8]+0x10]-4`)的编译与求值。递归下降 parser → 后缀式,加载期编译、命中时求值。纯 C,不依赖 QBDI(便于在 mac 上直接编译自测) | 改表达式语法时 |
@@ -121,12 +121,15 @@
    - watch 字段是**另一套**清单(默认值在 `TraceEditVC.m` 不在 `ConfigStore.m`),见上面 §A2。
 2. **子工程 include 路径**:`$(THEOS_PROJECT_DIR)` 在 aggregate 里指**根目录**,不是子目录。必须写全 `Engine/src`、`GUI/src`。
 3. **Info.plist 位置**:App 的必须在 `GUI/Resources/Info.plist`。放错地方能编译成功但装上没图标。
-4. **trampoline 必须保存完整 CPU 状态,不只是通用寄存器**。`DobbyHook` 是纯跳转,不替你存任何东西;hook 点又在函数中间,没有 ABI 保护。除 x0-x30/sp 外还必须存:
+4. **trampoline 必须保存完整 CPU 状态,不只是通用寄存器**。`DobbyHook` 是纯跳转,不替你存任何东西;hook 点又在函数中间,没有 ABI 保护。除通用寄存器/sp 外还必须存:
    - **NZCV** —— 漏了会让原代码的 `b.eq`/`cbz` 基于 C 代码留下的标志位跳转。**曾经踩过**:hook 点在循环里、退出判断被带偏 → 同一个函数被反复执行上百万次,现象酷似死锁(x21 和数据一直不变),实际是控制流出不来。C 代码越长(比如加了触发条件的表达式求值 + `memcmp`)越必然触发。
    - **q0-q31** —— `memcpy`/`memcmp`/字符串搜索都用 NEON;ABI 只保护 v8-v15 的低 64 位,而原代码可能正拿着任意 v 寄存器。
    - **FPCR/FPSR** —— 顺手存。
 
    `msr nzcv` 要排在恢复通用寄存器**之前**(借 x9,之后 x9 会被还原)。栈帧 `0x320`,`TraceRegFile` 仍在 `sp+0` 的前 `0x100` 字节 —— **这个结构别动**,`trace_ctx_entry` 按它取寄存器。
+
+   **x17 是唯一例外**:Dobby 的 `ARM64_TMP_REG_NDX_0` 在 arm64 上是 17，入口跳板已经把它定义为临时寄存器。`trace_ctx_entry` 返回的 origin 必须一直放在 x17，恢复时只从 `sp+0x80` 取回 x16，最后 `br x17`。绝不能把 origin 放进 x16 后再执行 `ldp x16, x17` —— 那会覆盖续跑地址，并可能无限重复同一 hook 现场。`tramp.c` 已用预处理检查锁定这项 Dobby 契约。
+   因为 x17 在到达本项目 trampoline 前就可能被 Dobby 改写，配置触发条件或 watch 时也不要把 x17 当作可靠的原程序寄存器值。
 
    **改完必须反汇编核对**,32 个槽位逐个确认:
    ```sh
@@ -134,11 +137,14 @@
    otool -tV "$BIN" | grep -A1 "sub.*sp, sp, #0x320" | grep -c "stp	x0, x1"  # 应为 32
    otool -tV "$BIN" | grep -c "msr.*NZCV"                                     # 应为 32
    otool -tV "$BIN" | grep -B1 "bl.*_trace_ctx_entry" | grep "mov.*x1, #"     # slot 应是 0x0..0x1f
+   otool -tV "$BIN" | grep -c "mov.*x17, x0"                                  # 应为 32
+   otool -tV "$BIN" | grep -c "ldr.*x16, \[sp, #0x80\]"                       # 应为 32
+   otool -tV "$BIN" | grep -c "br.*x17"                                       # 至少 32；逐个槽位确认
    ```
 5. **`trace_ctx_entry` 是每次 hook 命中都跑的热路径,别往里塞"看起来无害"的活**。踩过的坑:它原来每次命中都调 `find_module()` —— 而那个函数会遍历进程里**所有 dyld 镜像**、对每个路径做 `strstr`,还会获取 **dyld 内部锁**。一个大 app 有几百个镜像,hook 点每秒命中几十万次的话就是每秒上亿次字符串搜索 + 疯狂抢 dyld 锁,足以把**整个进程**拖到不可用(表现为"某个线程卡死在一处、数据反复相同",因为负责干活的线程被拖死了,新数据进不来)。
    - 模块基址装 hook 时就算好存进 `g_module_base[slot]`(进程生命周期内不变),命中时直接读数组。
    - 同理:别在这里做内存分配、ObjC 消息、加锁、syscall。目前每次命中只有 **1 次 `vm_read_overwrite`**(条件求值读内存),这已经是上限。
-   - `trace_ctx_entry` **任何分支都不能返回 0** —— trampoline 会 `br` 到这个返回值,0 就是跳 NULL 直接崩。拿不到 origin 时退回 `base + start + QBDI_PATCH_SIZE`。
+   - `trace_ctx_entry` **任何正常分支都不能返回 0**。拿不到 origin 时退回 `base + start + QBDI_PATCH_SIZE`；汇编层另以现场 LR 兜底，避免异常分支直接 `br 0`，但不能把 LR 兜底当成正常续跑方案。
 6. **QBDI 用虚拟栈**:`trace_ctx_entry` 里 QBDI 跑虚拟栈只记录、原生再跑一遍。别改回"真实栈"(会让 QBDI 引擎 abort)。
 7. **地址是偏移不是 VA**:配置里的 start/end/offset 都是相对模块基址,别加 slide。
 8. **改了 UI 但设备上没变化 → 十有八九是没装上新包**,不是代码问题。`build_debs.sh` 会用构建时间更新包版本和文件名；手动 `make package` 仍要自行升 Version。验证套路见下面「验证改动是否真的生效」。
@@ -290,3 +296,7 @@ GUI 校验与引擎 parser 的判断、size 两侧的进制解析都交叉比对
     完全不动,说明还是卡在同一次调用的同一个循环里,得继续查
 39. hook 点选得太热时(每秒命中几十万次)即便只剩 1 次 `vm_read_overwrite` 也会拖慢;
     这种情况应该换一个"每次请求只过一遍"的位置,而不是靠优化引擎
+40. **续跑寄存器回归测试**:同一 hook 点让 `x21` 先后指向 `this is a string` 和
+    `this is a key`，触发条件设 `x21` + 字符串包含 `key`；第一次应 miss、第二次应命中，
+    诊断里的地址/内容必须随调用变化。若始终停在第一次，立即反汇编确认结尾是
+    `mov x17, x0` → 恢复 x16 → `br x17`，且中间没有恢复覆盖 x17。
