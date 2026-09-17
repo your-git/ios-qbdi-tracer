@@ -30,7 +30,7 @@
 | `src/HexValue.{h,m}` | ~50 | 「字节长度」类字段(watch 的 `size`、触发条件的 `triggerScan`)的进制处理:`HexValueFromJSON`(JSON 看前缀定进制)/ `HexParseInput`(输入框一律 hex)/ `HexDisplay`。**与引擎 `parse_size` 规则必须一致** |
 | `src/NavController.{h,m}` | ~50 | `UINavigationController` 子类,override `navigationBar:shouldPopItem:` 来**拦住系统返回按钮**(UIKit 没有公开的"即将 pop"回调;这依赖 UINavigationController 私下就是自己 navigationBar 的 delegate)。含 `NavPopGuard` 协议 |
 | `src/FormEditVC.{h,m}` | ~120 | 表单编辑页**基类**:快照 / 脏检查 / 「放弃修改?」确认；编辑页显示期间一律禁用右滑返回。TraceEditVC 和 WatchEditVC 都继承它 |
-| `src/RootListVC.m` | 221 | 主界面。总开关 + 条目列表。点击=编辑,前缘滑=启停,尾缘滑=复制/删除(删除弹确认框),+ 按钮=加trace(先进 AppPicker) |
+| `src/RootListVC.m` | ~450 | 主界面。总开关 + 条目列表。点击=编辑,前缘滑=启停,尾缘滑=命名/导出/复制/删除。自定义名称存在时用三行展示，旧 JSON 仍用两行 |
 | `src/AppPickerVC.m` | 141 | 应用选择器。`LSApplicationWorkspace`(私有 API)列所有 app 图标+名字+bundleId,带搜索 |
 | `src/TraceEditVC.m` | ~680 | trace 表单。**5 段**:App信息/模块地址/选项/触发条件/watches子表(trace 次数和原来的 logMask 均已隐藏)。触发条件那段按匹配方式伸缩，并在启用时显示「改为无条件」按钮。「完成」里带 end-start ≥ 0x10、表达式语法、期望值格式、搜索窗口的校验 |
 | `src/WatchEditVC.m` | ~217 | watch 表单。寄存器/action 用 action sheet;寄存器那栏顶部的「✎ 输入取址表达式…」走 `ExprInput` 的弹窗;size 走 `HexValue` |
@@ -162,6 +162,8 @@
 20. **不要再恢复固定 1000 万条静默截断**:`qbdi_run` 的返回值只表示至少执行了一个 block，`ok=1` 不代表已到 end。旧逻辑在 `inst=10000001 ok=1` 时已经是被上限强制停止。现在 `maxInstructions` 缺省/0 不再按指令数截断，非 0 才启用保护；不限制时每 1000 万条向系统控制台报告当前 PC/end，但继续跑。退出日志必须保留 `reason=end|instruction-limit|qbdi-failed|unexpected-stop` 和最终 PC，只有 `state->pc == end` 才可标记 `reason=end`。被上限截断时还要打印 next PC 并写入系统控制台。
 21. **`ConfigStore.m` 的导入白名单**:`importItemFromData` 里那个 key 数组是写死的,**加了 item 级字段就得加进去**,否则"导出→导入"会把新字段静默丢掉。
 22. **别用 UTF-8 在二进制里搜中文字符串来验证**:含非 ASCII 的 `@"中文"` NSString 字面量,clang 会编成 **UTF-16** 存进 `__ustring` 段(不是 UTF-8 的 `__cstring`)。用 UTF-8 搜会全部 "missing" —— 这是**误报**,不代表字符串没编进去。要搜就搜 UTF-16LE(`kw.encode('utf-16-le')`)。ASCII 字符串才在 `__cstring` 里。
+23. **启停只能在写入 JSON 成功后更新界面**:保存失败时要恢复内存中的 `enabled`，否则会出现“界面已停用，目标 App 重启后仍启用”。UI 和引擎对旧 JSON 缺失 `enabled` 的默认值都必须是 `true`，否则会显示为停用但引擎仍执行。引擎只在目标 App 启动时读一次配置，所以成功切换后仍必须重启目标 App。
+24. **`traceName` 是可选展示字段**:旧 JSON 没有时必须保持原来的两行展示；导入白名单必须保留它，复制/导出也必须带上。空白名称要删除 key，不要显示空的第一行。
 
 ## 本机自测(不用设备、不用 theos)
 
@@ -301,3 +303,7 @@ GUI 校验与引擎 parser 的判断、size 两侧的进制解析都交叉比对
     `this is a key`，触发条件设 `x21` + 字符串包含 `key`；第一次应 miss、第二次应命中，
     诊断里的地址/内容必须随调用变化。若始终停在第一次，立即反汇编确认结尾是
     `mov x17, x0` → 恢复 x16 → `br x17`，且中间没有恢复覆盖 x17。
+41. **启停两种入口**:右滑到底自动执行、只露出按钮再点击，两者都应更新勾选并提示“重启目标 App 后生效”；重启后核对 JSON 与引擎行为一致。
+42. **启停保存失败**:在测试环境临时使配置目录不可写，操作后必须提示失败并恢复原勾选，不得出现假启用/假停用。
+43. **自定义名称**:左滑「命名」后显示三行；再次命名为空后恢复旧两行。名称同时出现在 hook 安装日志中。
+44. **名称兼容性**:旧 JSON 打开无空白行；命名后复制、导出再导入，`traceName` 都不丢失。

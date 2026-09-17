@@ -90,6 +90,7 @@
     return [@{
         @"id": [[NSUUID UUID] UUIDString],
         @"enabled": @YES,
+        @"traceName": @"",       /* 可选的用户自定义名称 */
         @"bundleId": @"",
         @"appName": @"",
         @"module": @"",
@@ -226,7 +227,7 @@ static NSString *sanitizeName(NSString *s) {
     /* 以 newItem 为模板补齐缺省字段,再覆盖已有值 */
     NSMutableDictionary *out = [self newItem];
     /* 加字段记得加进这个白名单,否则导出再导入会把它丢掉 */
-    for (NSString *k in @[ @"enabled", @"bundleId", @"appName", @"module",
+    for (NSString *k in @[ @"enabled", @"traceName", @"bundleId", @"appName", @"module",
                            @"start", @"end", @"count", @"moduleOnly",
                            @"delaySecs", @"logMask", @"maxInstructions",
                            @"triggerExpr", @"triggerMatch", @"triggerValue",

@@ -234,6 +234,7 @@ after N filtered calls`。
     {
       "id": "uuid",                   // 条目唯一 id
       "enabled": true,                // 该条目勾选状态
+      "traceName": "登录签名计算",     // 可选的用户自定义名称;缺省/空=旧版展示
       "bundleId": "com.zhiliaoapp.musically",
       "appName": "settings",            // 仅 UI 展示
       "module": "MainModule",      // dyld 镜像名子串

@@ -1221,6 +1221,7 @@ uint64_t trace(const char *module, uint64_t static_start, uint64_t static_end,
     }
 
     TraceSpec spec = {
+        .trace_name = NULL,
         .module = module,
         .static_start = static_start,
         .static_end = static_end,

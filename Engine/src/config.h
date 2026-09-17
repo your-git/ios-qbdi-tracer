@@ -27,6 +27,7 @@ typedef enum {
 
 /* 一条 trace 区间(运行期由 engine.m 从 JSON 填充) */
 typedef struct {
+    const char *trace_name;   /* 用户自定义名称,仅用于诊断日志,可为 NULL */
     const char *module;       /* dyld 镜像名子串,如 "ModuleName" */
     uint64_t    static_start; /* 相对模块基址的偏移(与 Frida module_base.add(x) 一致) */
     uint64_t    static_end;   /* 执行到该地址即停,该地址本身不执行 */

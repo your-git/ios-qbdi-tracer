@@ -295,8 +295,9 @@ static void load_watches(NSArray *warr) {
 /* 对一个槽位装 Dobby hook(在该条目的延迟到点后调用) */
 static void install_slot(int slot) {
     TraceSpec *t = &g_traces[slot];
-    qbdi_trace_logf("[engine] installing hook: slot=%d target=%s+0x%llx\n",
-                    slot, t->module ? t->module : "(null)",
+    qbdi_trace_logf("[engine] installing hook: slot=%d name=%s target=%s+0x%llx\n",
+                    slot, t->trace_name ? t->trace_name : "(unnamed)",
+                    t->module ? t->module : "(null)",
                     (unsigned long long)t->static_start);
     uint64_t base = 0;
     if (!find_module(t->module, &base)) {
@@ -366,12 +367,21 @@ void engine_start(void) {
             if (![it isKindOfClass:[NSDictionary class]]) {
                 continue;
             }
-            if (!parse_bool(it[@"enabled"], true)) {
-                continue;
-            }
             id bid = it[@"bundleId"];
             if (![bid isKindOfClass:[NSString class]] || bundleId == nil ||
                 ![bid isEqualToString:bundleId]) {
+                continue;
+            }
+            if (!parse_bool(it[@"enabled"], true)) {
+                id namev = it[@"traceName"];
+                id modv = it[@"module"];
+                qbdi_console_logf(
+                    "trace disabled, skip: name=%s target=%s+0x%llx",
+                    [namev isKindOfClass:[NSString class]] && [namev length]
+                        ? [namev UTF8String] : "(unnamed)",
+                    [modv isKindOfClass:[NSString class]]
+                        ? [modv UTF8String] : "(unknown)",
+                    (unsigned long long)parse_hex(it[@"start"]));
                 continue;
             }
             /* 去重键:模块名 + 起始偏移(归一化成数值,兼容 "0x100"/"256" 混写) */
@@ -407,6 +417,7 @@ void engine_start(void) {
             }
             int slot = g_trace_count;
             TraceSpec *t = &g_traces[slot];
+            t->trace_name   = dup_str(it[@"traceName"]);
             t->module       = dup_str(it[@"module"]);
             t->static_start = parse_hex(it[@"start"]);
             t->static_end   = parse_hex(it[@"end"]);

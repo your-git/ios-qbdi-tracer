@@ -4,11 +4,35 @@
 #import "TraceEditVC.h"
 #import "ImportVC.h"
 
+/* 用户自定义名称是可选字段；旧 JSON 没有该 key 时自然回落到旧展示。 */
+static NSString *traceName(NSDictionary *item) {
+    id raw = item[@"traceName"];
+    if (![raw isKindOfClass:[NSString class]]) return @"";
+    return [raw stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+/* 与引擎 parse_bool(it[@"enabled"], true) 保持一致：旧 JSON 缺字段
+ * 时应视为启用。原来直接对 nil 调 boolValue 会让 UI 误显示为停用。 */
+static BOOL traceEnabled(NSDictionary *item) {
+    id raw = item[@"enabled"];
+    return [raw isKindOfClass:[NSNumber class]] ? [raw boolValue] : YES;
+}
+
+@interface RootListVC ()
+- (BOOL)persist;
+- (void)reloadItem:(NSDictionary *)item;
+- (void)renameItem:(NSMutableDictionary *)item
+              done:(void (^)(BOOL))done;
+@end
+
 @implementation RootListVC
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"QBDI Tracer";
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 68.0;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
         initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
                              target:self
@@ -181,7 +205,7 @@
 
 - (NSString *)tableView:(UITableView *)tableView
     titleForHeaderInSection:(NSInteger)section {
-    return section == 0 ? @"插件" : @"Trace 条目(点击编辑,左滑复制/删除)";
+    return section == 0 ? @"插件" : @"Trace 条目(点击编辑,左右滑动管理)";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView
@@ -217,19 +241,33 @@
     }
     NSDictionary *it = [self store].items[indexPath.row];
     NSString *app = [it[@"appName"] length] ? it[@"appName"] : it[@"bundleId"];
-    cell.textLabel.text = [NSString stringWithFormat:@"%@  %@",
-                           app ?: @"?", it[@"module"] ?: @""];
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ - %@",
-                                  it[@"start"], it[@"end"]];
-    cell.accessoryType = [it[@"enabled"] boolValue]
+    NSString *target = [NSString stringWithFormat:@"%@  %@",
+                        app ?: @"?", it[@"module"] ?: @""];
+    NSString *range = [NSString stringWithFormat:@"%@ - %@",
+                       it[@"start"] ?: @"?", it[@"end"] ?: @"?"];
+    NSString *name = traceName(it);
+    if (name.length > 0) {
+        cell.textLabel.text = name;
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@\n%@", target, range];
+        cell.detailTextLabel.numberOfLines = 2;
+    } else {
+        cell.textLabel.text = target;
+        cell.detailTextLabel.text = range;
+        cell.detailTextLabel.numberOfLines = 1;
+    }
+    cell.accessoryType = traceEnabled(it)
                              ? UITableViewCellAccessoryCheckmark
                              : UITableViewCellAccessoryNone;
     return cell;
 }
 
 - (void)toggleEnabled:(UISwitch *)sw {
+    BOOL oldValue = [self store].enabled;
     [self store].enabled = sw.on;
-    [self persist];
+    if (![self persist]) {
+        [self store].enabled = oldValue;
+        [sw setOn:oldValue animated:YES];
+    }
 }
 
 - (void)tableView:(UITableView *)tableView
@@ -249,31 +287,51 @@
     leadingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == 0) return nil;
     NSMutableDictionary *it = [self store].items[indexPath.row];
-    BOOL on = [it[@"enabled"] boolValue];
+    BOOL on = traceEnabled(it);
     __weak typeof(self) weakSelf = self;
     UIContextualAction *toggle = [UIContextualAction
         contextualActionWithStyle:UIContextualActionStyleNormal
                             title:(on ? @"停用" : @"启用")
                           handler:^(UIContextualAction *a, UIView *v,
                                     void (^done)(BOOL)) {
-              it[@"enabled"] = @(!on);
-              [weakSelf persist];
-              [weakSelf.tableView reloadRowsAtIndexPaths:@[ indexPath ]
-                                       withRowAnimation:UITableViewRowAnimationAutomatic];
-              done(YES);
+              /* 按钮显示后到真正执行之间可能经历列表刷新，因此在这里
+               * 重新读取最新状态，不使用上面只为标题/颜色服务的 on。 */
+              BOOL oldValue = traceEnabled(it);
+              BOOL newValue = !oldValue;
+              it[@"enabled"] = @(newValue);
+              BOOL saved = [[weakSelf store] save];
+              if (!saved) {
+                  /* 文件未写入时把内存也恢复，避免界面与 JSON 不一致。 */
+                  it[@"enabled"] = @(oldValue);
+              }
+              done(saved);
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  [weakSelf reloadItem:it];
+                  if (saved) {
+                      [weakSelf toast:(newValue
+                          ? @"已启用，重启目标 App 后生效"
+                          : @"已停用，重启目标 App 后生效")];
+                  } else {
+                      [weakSelf toast:@"保存失败，已恢复原状态（检查配置目录权限）"];
+                  }
+              });
           }];
     toggle.backgroundColor =
         on ? [UIColor systemGrayColor] : [UIColor systemGreenColor];
-    return [UISwipeActionsConfiguration configurationWithActions:@[ toggle ]];
+    UISwipeActionsConfiguration *cfg =
+        [UISwipeActionsConfiguration configurationWithActions:@[ toggle ]];
+    cfg.performsFirstActionWithFullSwipe = YES;
+    return cfg;
 }
 
-#pragma mark - 左滑:复制 / 删除
+#pragma mark - 左滑:命名 / 导出 / 复制 / 删除
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
     trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == 0) return nil;
 
     __weak typeof(self) weakSelf = self;
+    NSMutableDictionary *it = [self store].items[indexPath.row];
     UIContextualAction *del = [UIContextualAction
         contextualActionWithStyle:UIContextualActionStyleDestructive
                             title:@"删除"
@@ -299,9 +357,74 @@
               done(YES);
           }];
     exp.backgroundColor = [UIColor systemGreenColor];
-    /* 顺序:导出 / 复制 / 删除(尾缘从右往左显示,数组首个最靠右) */
+    UIContextualAction *rename = [UIContextualAction
+        contextualActionWithStyle:UIContextualActionStyleNormal
+                            title:@"命名"
+                          handler:^(UIContextualAction *a, UIView *v,
+                                    void (^done)(BOOL)) {
+              [weakSelf renameItem:it done:done];
+          }];
+    rename.backgroundColor = [UIColor systemOrangeColor];
+    /* 保留原有三个操作的相对位置，命名放在最外侧。 */
     return [UISwipeActionsConfiguration
-        configurationWithActions:@[ del, copy, exp ]];
+        configurationWithActions:@[ del, copy, exp, rename ]];
+}
+
+- (void)renameItem:(NSMutableDictionary *)item
+              done:(void (^)(BOOL))done {
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"Trace 命名"
+                         message:@"名称只用于区分条目；留空会清除自定义名称。"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"例：登录签名计算";
+        field.text = traceName(item);
+        field.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消"
+                                           style:UIAlertActionStyleCancel
+                                         handler:^(UIAlertAction *a) {
+                                             done(NO);
+                                         }]];
+    __weak typeof(self) weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"保存"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+        id oldValue = item[@"traceName"];
+        NSString *name = [ac.textFields.firstObject.text
+            stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (name.length > 0) {
+            item[@"traceName"] = name;
+        } else {
+            [item removeObjectForKey:@"traceName"];
+        }
+
+        BOOL saved = [[weakSelf store] save];
+        if (!saved) {
+            if (oldValue != nil) {
+                item[@"traceName"] = oldValue;
+            } else {
+                [item removeObjectForKey:@"traceName"];
+            }
+        }
+        done(saved);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf reloadItem:item];
+            if (!saved) {
+                [weakSelf toast:@"保存失败，已恢复原名称（检查配置目录权限）"];
+            }
+        });
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)reloadItem:(NSDictionary *)item {
+    NSUInteger row = [[self store].items indexOfObjectIdenticalTo:item];
+    if (row == NSNotFound) return;
+    NSIndexPath *ip = [NSIndexPath indexPathForRow:(NSInteger)row inSection:1];
+    [self.tableView reloadRowsAtIndexPaths:@[ ip ]
+                           withRowAnimation:UITableViewRowAnimationAutomatic];
 }
 
 - (void)exportAt:(NSIndexPath *)indexPath {
@@ -342,10 +465,14 @@
 - (void)confirmDeleteAt:(NSIndexPath *)indexPath done:(void (^)(BOOL))done {
     NSDictionary *it = [self store].items[indexPath.row];
     NSString *app = [it[@"appName"] length] ? it[@"appName"] : it[@"bundleId"];
+    NSString *name = traceName(it);
+    NSString *what = name.length > 0
+        ? [NSString stringWithFormat:@"%@（%@ %@）", name, app ?: @"",
+                                   it[@"module"] ?: @""]
+        : [NSString stringWithFormat:@"%@ %@", app ?: @"", it[@"module"] ?: @""];
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"删除确认"
-                         message:[NSString stringWithFormat:@"确定删除 “%@ %@” 吗?",
-                                  app ?: @"", it[@"module"] ?: @""]
+                         message:[NSString stringWithFormat:@"确定删除 “%@” 吗?", what]
                   preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消"
                                            style:UIAlertActionStyleCancel
@@ -365,10 +492,12 @@
 
 #pragma mark - 保存
 
-- (void)persist {
-    if (![[self store] save]) {
+- (BOOL)persist {
+    BOOL ok = [[self store] save];
+    if (!ok) {
         [self toast:@"保存失败(检查配置目录权限)"];
     }
+    return ok;
 }
 
 - (void)toast:(NSString *)msg {

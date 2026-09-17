@@ -2,7 +2,7 @@
 
 /* 配置读写:与引擎 engine.m 同一路径、同一 JSON schema。
  * 顶层: { enabled: bool, items: [ item... ] }
- * item:  { id, enabled, bundleId, appName, module, start, end, count,
+ * item:  { id, enabled, traceName(可选), bundleId, appName, module, start, end, count,
  *          moduleOnly, delaySecs, logMask, maxInstructions(可选,0=不限制),
  *          triggerExpr, triggerMatch, triggerValue,
  *          triggerWhere, triggerScan,                 // 触发条件(可选)
