@@ -14,9 +14,6 @@ enum {
 /* 无配置时的兜底 mask(正常都由每条目 log_mask 覆盖) */
 #define TRACE_DEFAULT_MASK (LOG_INST)
 
-/* 单次 trace 最多记录指令数,防止死循环把设备拖垮 */
-#define TRACE_MAX_INST 10000000
-
 #define TRACE_MAX_TARGETS 32
 #define TRACE_MAX_WATCHES 128
 /* Dobby 在 arm64 上的补丁长度:补丁覆盖 [start, start+16),原代码从 start+16 继续 */

@@ -32,6 +32,8 @@
 #define WATCH_HEXDUMP_MAX 0x10000
 /* Dobby 搬走的原函数序言代码范围:覆盖 origin trampoline 里被搬迁的那几条指令 */
 #define ORIGIN_SPAN 0x40
+/* 不设指令上限时的稀疏进度诊断，不会停止 trace。 */
+#define TRACE_PROGRESS_INTERVAL 10000000ULL
 #define CONSOLE_PREFIX "[ios-qbdi-tracer]"
 
 /* 手动路径的入参(线程局部) */
@@ -51,6 +53,11 @@ typedef struct {
     uint64_t origin;
     FILE *out;
     uint64_t inst_count;
+    uint64_t max_instructions;
+    uint64_t end;
+    uint64_t next_progress;
+    uint64_t stop_pc; /* 被指令上限拦下的下一条指令 */
+    bool instruction_limit_reached;
     uint64_t prev[32]; /* x0..x28, fp, lr, sp 寄存器增量对比 */
     __uint128_t prev_v[32]; /* v0..v31 向量寄存器增量对比(仅 LOG_VREG 时用) */
     int has_prev;
@@ -752,8 +759,24 @@ static VMAction inst_cb(VMInstanceRef vm, GPRState *gpr, FPRState *fpr,
     if (ia == NULL) {
         return QBDI_CONTINUE;
     }
-    if (++c->inst_count > TRACE_MAX_INST) {
+    /* 0 表示严格跑到 qbdi_run 的 stop address。上限检查放在计数前，
+     * 这样日志中的 inst 始终是实际执行过的指令数，不再出现
+     * “上限 + 1”。 */
+    if (c->max_instructions != 0 &&
+        c->inst_count >= c->max_instructions) {
+        c->instruction_limit_reached = true;
+        c->stop_pc = ia->address;
         return QBDI_STOP;
+    }
+    c->inst_count++;
+    if (c->max_instructions == 0 && c->inst_count == c->next_progress) {
+        qbdi_console_logf(
+            "[%s] trace still running: inst=%llu pc=0x%llx end=0x%llx",
+            c->module, (unsigned long long)c->inst_count,
+            (unsigned long long)ia->address, (unsigned long long)c->end);
+        if (UINT64_MAX - c->next_progress >= TRACE_PROGRESS_INTERVAL) {
+            c->next_progress += TRACE_PROGRESS_INTERVAL;
+        }
     }
 
     /* 相对模块偏移:Dobby origin 序言映射回模块偏移,其余直接减模块基址 */
@@ -994,6 +1017,9 @@ static uint64_t run_trace(const TraceSpec *spec, uint64_t base, void *origin,
     ctx.static_start = spec->static_start;
     ctx.origin       = (uint64_t)(uintptr_t)origin;
     ctx.out          = out;
+    ctx.max_instructions = spec->max_instructions;
+    ctx.end = end;
+    ctx.next_progress = TRACE_PROGRESS_INTERVAL;
     qbdi_addCodeCB(vm, QBDI_PREINST, inst_cb, &ctx, 0);
 
     qbdi_trace_logf("[%s] trace#%d step: set regs, entry=%p end=0x%llx\n",
@@ -1005,11 +1031,24 @@ static uint64_t run_trace(const TraceSpec *spec, uint64_t base, void *origin,
     state->x29 = rf->fp;
     state->lr = end;
 
-    qbdi_trace_logf(
-        "[%s] ==== trace#%d enter %s+0x%llx -> %s+0x%llx entry=%p scope=%s ====\n",
-        spec->module, no, spec->module, (unsigned long long)spec->static_start,
-        spec->module, (unsigned long long)spec->static_end,
-        (void *)(uintptr_t)entry, spec->module_only ? "module" : "all");
+    if (spec->max_instructions == 0) {
+        qbdi_trace_logf(
+            "[%s] ==== trace#%d enter %s+0x%llx -> %s+0x%llx entry=%p "
+            "scope=%s maxInst=unlimited ====\n",
+            spec->module, no, spec->module,
+            (unsigned long long)spec->static_start, spec->module,
+            (unsigned long long)spec->static_end, (void *)(uintptr_t)entry,
+            spec->module_only ? "module" : "all");
+    } else {
+        qbdi_trace_logf(
+            "[%s] ==== trace#%d enter %s+0x%llx -> %s+0x%llx entry=%p "
+            "scope=%s maxInst=%llu ====\n",
+            spec->module, no, spec->module,
+            (unsigned long long)spec->static_start, spec->module,
+            (unsigned long long)spec->static_end, (void *)(uintptr_t)entry,
+            spec->module_only ? "module" : "all",
+            (unsigned long long)spec->max_instructions);
+    }
 
     qbdi_trace_logf("[%s] trace#%d step: qbdi_run\n", spec->module, no);
     bool ok = qbdi_run(vm, entry, end);
@@ -1024,12 +1063,39 @@ static uint64_t run_trace(const TraceSpec *spec, uint64_t base, void *origin,
     }
     uint64_t ret = state->x0;
 
-    qbdi_trace_logf("[%s] ==== trace#%d exit ret=0x%llx inst=%llu ok=%d ====\n",
-                    spec->module, no, (unsigned long long)ret,
-                    (unsigned long long)ctx.inst_count, ok);
-    if (!ok) {
+    /* qbdi_run=true 只表示至少执行了一个 block，不等于已命中
+     * stop address。必须再核对 PC，否则其他异常停止仍会被误报成 end。 */
+    const char *reason = !ok ? "qbdi-failed"
+                             : (ctx.instruction_limit_reached
+                                    ? "instruction-limit"
+                                    : (state->pc == end ? "end"
+                                                        : "unexpected-stop"));
+    qbdi_trace_logf(
+        "[%s] ==== trace#%d exit ret=0x%llx inst=%llu ok=%d reason=%s "
+        "pc=0x%llx ====\n",
+        spec->module, no, (unsigned long long)ret,
+        (unsigned long long)ctx.inst_count, ok, reason,
+        (unsigned long long)state->pc);
+    if (ctx.instruction_limit_reached) {
+        qbdi_console_logf(
+            "[%s] trace#%d TRUNCATED: instruction limit %llu reached before "
+            "end, next pc=0x%llx",
+            spec->module, no, (unsigned long long)spec->max_instructions,
+            (unsigned long long)ctx.stop_pc);
+        qbdi_trace_logf(
+            "[%s] trace#%d truncated before end=0x%llx, next pc=0x%llx; "
+            "raise maxInstructions or set it to 0\n",
+            spec->module, no, (unsigned long long)end,
+            (unsigned long long)ctx.stop_pc);
+    } else if (!ok) {
         qbdi_console_logf("[%s] trace#%d FAILED: qbdi_run returned false",
                           spec->module, no);
+    } else if (state->pc != end) {
+        qbdi_console_logf(
+            "[%s] trace#%d FAILED: QBDI stopped before end, pc=0x%llx "
+            "end=0x%llx",
+            spec->module, no, (unsigned long long)state->pc,
+            (unsigned long long)end);
     }
 
     if (fakestack != NULL) {
@@ -1154,8 +1220,16 @@ uint64_t trace(const char *module, uint64_t static_start, uint64_t static_end,
         return 0;
     }
 
-    TraceSpec spec = { module, static_start, static_end, module_only, count, 0,
-                       TRACE_DEFAULT_MASK };
+    TraceSpec spec = {
+        .module = module,
+        .static_start = static_start,
+        .static_end = static_end,
+        .module_only = module_only,
+        .count = count,
+        .delay_secs = 0,
+        .log_mask = TRACE_DEFAULT_MASK,
+        .max_instructions = 0,
+    };
     TraceRegFile rf;
     memset(&rf, 0, sizeof(rf));
     for (int i = 0; i < 8; i++) {

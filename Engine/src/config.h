@@ -34,6 +34,7 @@ typedef struct {
     int         count;        /* trace 次数:前 count 次执行 trace,之后透传 */
     int         delay_secs;   /* 本条目启动后延迟多少秒装 hook(0 = 立即) */
     uint64_t    log_mask;     /* LOG_INST|LOG_MEM|LOG_REGS|LOG_BRANCH */
+    uint64_t    max_instructions; /* 0=不截断,否则到上限后停止本次 QBDI */
 
     /* 触发条件:在 hook 点(static_start)用输入寄存器求值,不匹配就透传 ——
      * 不写日志、不消耗 count、不启动 QBDI。TRIG_NONE 时下面的字段都无意义。 */

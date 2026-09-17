@@ -159,8 +159,9 @@
 17. **`vm_read_overwrite` 跨到未映射页会整块失败**(返回 0,不是"读到一部分")。所以 `trigger_read()` 在整块失败时退到"只读本页末尾"。任何"读一个窗口"的新代码都要照这个处理,否则窗口一调大就什么都读不到。
 18. **在每次 hook 命中都跑的代码里,成本是 mach trap 次数,不是字节数**。`trigger_hit` 一次读满窗口(而不是像 `watch_read_string` 那样每 64 字节一趟),所以 `contains` 和 `prefix` 速度基本一样。新增这类逻辑时别退化成分块读。
 19. **同一个 hook 点会被多个线程同时命中**,所以 `trace_ctx_entry` 里的共享状态都得是原子的:`g_remaining`(非原子的话两个线程能把 `count=1` 用成两次)、`g_filtered`、`g_trig_next_log`(用 CAS 决定"这次该谁打诊断")。日志也一样 —— `trigger_log_miss` 整段在一次加锁里写完,否则 `want:`/`got:` 几行会被别的线程插进来。
-20. **`ConfigStore.m` 的导入白名单**:`importItemFromData` 里那个 key 数组是写死的,**加了 item 级字段就得加进去**,否则"导出→导入"会把新字段静默丢掉。
-21. **别用 UTF-8 在二进制里搜中文字符串来验证**:含非 ASCII 的 `@"中文"` NSString 字面量,clang 会编成 **UTF-16** 存进 `__ustring` 段(不是 UTF-8 的 `__cstring`)。用 UTF-8 搜会全部 "missing" —— 这是**误报**,不代表字符串没编进去。要搜就搜 UTF-16LE(`kw.encode('utf-16-le')`)。ASCII 字符串才在 `__cstring` 里。
+20. **不要再恢复固定 1000 万条静默截断**:`qbdi_run` 的返回值只表示至少执行了一个 block，`ok=1` 不代表已到 end。旧逻辑在 `inst=10000001 ok=1` 时已经是被上限强制停止。现在 `maxInstructions` 缺省/0 不再按指令数截断，非 0 才启用保护；不限制时每 1000 万条向系统控制台报告当前 PC/end，但继续跑。退出日志必须保留 `reason=end|instruction-limit|qbdi-failed|unexpected-stop` 和最终 PC，只有 `state->pc == end` 才可标记 `reason=end`。被上限截断时还要打印 next PC 并写入系统控制台。
+21. **`ConfigStore.m` 的导入白名单**:`importItemFromData` 里那个 key 数组是写死的,**加了 item 级字段就得加进去**,否则"导出→导入"会把新字段静默丢掉。
+22. **别用 UTF-8 在二进制里搜中文字符串来验证**:含非 ASCII 的 `@"中文"` NSString 字面量,clang 会编成 **UTF-16** 存进 `__ustring` 段(不是 UTF-8 的 `__cstring`)。用 UTF-8 搜会全部 "missing" —— 这是**误报**,不代表字符串没编进去。要搜就搜 UTF-16LE(`kw.encode('utf-16-le')`)。ASCII 字符串才在 `__cstring` 里。
 
 ## 本机自测(不用设备、不用 theos)
 

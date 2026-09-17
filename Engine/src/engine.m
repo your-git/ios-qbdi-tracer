@@ -414,6 +414,10 @@ void engine_start(void) {
             t->count        = parse_int(it[@"count"], 1);
             t->delay_secs   = parse_int(it[@"delaySecs"], 0);
             t->log_mask     = (uint64_t)parse_int(it[@"logMask"], LOG_INST);
+            /* 旧版固定在 1000 万条时静默截断，即使还没到 end。
+             * 精确 trace 的默认语义应是“跑到 end”；需要保护时可在 JSON
+             * 显式设 maxInstructions，0/缺省表示不限制。 */
+            t->max_instructions = parse_size(it[@"maxInstructions"]);
             if (t->module == NULL || t->static_end <= t->static_start) {
                 qbdi_trace_logf("[engine] skip invalid item (slot %d)\n", slot);
                 memset(t, 0, sizeof(*t));

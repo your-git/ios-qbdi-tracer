@@ -245,6 +245,7 @@ after N filtered calls`。
       "logMask": 17,                  // LOG_INST=1 MEM=2 REGS=4 BRANCH=8 VREG=16 位或
                                       // 界面已不再暴露这一栏,新建/编辑后统一写 17
                                       // (INST|VREG);引擎照旧按字段值跑,旧配置不受影响
+      "maxInstructions": 0,           // 可选;0/缺省=跑到 end,非 0=达上限时截断
       "triggerExpr": "[x2+0x10]",     // 触发条件:留空/缺失 = 无条件(默认)
       "triggerMatch": "bytes",        // notnull | bytes | cstr | u64
       "triggerValue": "08a48c90",     // bytes 按内存顺序;u64 是小端整数;notnull 不用填
