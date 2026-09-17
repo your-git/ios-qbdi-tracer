@@ -21,7 +21,7 @@ static BOOL traceEnabled(NSDictionary *item) {
 
 @interface RootListVC ()
 - (BOOL)persist;
-- (void)reloadItem:(NSDictionary *)item;
+- (void)reloadItem:(NSMutableDictionary *)item;
 - (void)renameItem:(NSMutableDictionary *)item
               done:(void (^)(BOOL))done;
 @end
@@ -419,7 +419,7 @@ static BOOL traceEnabled(NSDictionary *item) {
     [self presentViewController:ac animated:YES completion:nil];
 }
 
-- (void)reloadItem:(NSDictionary *)item {
+- (void)reloadItem:(NSMutableDictionary *)item {
     NSUInteger row = [[self store].items indexOfObjectIdenticalTo:item];
     if (row == NSNotFound) return;
     NSIndexPath *ip = [NSIndexPath indexPathForRow:(NSInteger)row inSection:1];
