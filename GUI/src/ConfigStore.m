@@ -98,7 +98,7 @@
         @"count": @1,
         @"moduleOnly": @YES,
         @"delaySecs": @0,
-        @"logMask": @1,          /* LOG_INST */
+        @"logMask": @17,         /* LOG_INST | LOG_VREG(界面已不再让用户选) */
         @"watches": [NSMutableArray array],
     } mutableCopy];
 }
@@ -224,9 +224,12 @@ static NSString *sanitizeName(NSString *s) {
 
     /* 以 newItem 为模板补齐缺省字段,再覆盖已有值 */
     NSMutableDictionary *out = [self newItem];
+    /* 加字段记得加进这个白名单,否则导出再导入会把它丢掉 */
     for (NSString *k in @[ @"enabled", @"bundleId", @"appName", @"module",
                            @"start", @"end", @"count", @"moduleOnly",
-                           @"delaySecs", @"logMask" ]) {
+                           @"delaySecs", @"logMask",
+                           @"triggerExpr", @"triggerMatch", @"triggerValue",
+                           @"triggerWhere", @"triggerScan" ]) {
         if (item[k] != nil) out[k] = item[k];
     }
     /* watches 深拷成可变 */

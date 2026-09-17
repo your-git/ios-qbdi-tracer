@@ -11,7 +11,8 @@ endif
 
 TWEAK_NAME = TracerEngine
 
-TracerEngine_FILES = Tweak.x src/engine.m src/tramp.c src/qbdi_trace.c
+TracerEngine_FILES = Tweak.x src/engine.m src/tramp.c src/qbdi_trace.c \
+                     src/watch_expr.c
 TracerEngine_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-unused-parameter \
                       -I$(THEOS_PROJECT_DIR)/Engine/include \
                       -I$(THEOS_PROJECT_DIR)/Engine/src

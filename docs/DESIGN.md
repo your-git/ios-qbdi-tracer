@@ -57,11 +57,36 @@ iOS 指令级 tracer:**运行期 JSON 配置 + 手机 UI 管理**,改配置不�
 被 trace 的代码常在**函数中段**,依赖调用方保留寄存器(x19-x28)。普通 C 函数拿不到这些寄存器。所以 hook 的落点是一段 **naked arm64 汇编 trampoline**(`Engine/src/tramp.c`):
 
 ```
-保存 x0-x28 / fp / lr / 真实sp 到栈  →  bl trace_ctx_entry(rf, slot)
-→ 恢复全部寄存器(sp 用真实sp)  →  br 续跑地址
+保存 x0-x28 / fp / lr / 真实sp / NZCV / FPCR / FPSR / q0-q31 到栈
+  →  bl trace_ctx_entry(rf, slot)
+  →  原样恢复上面所有东西(sp 用真实sp)  →  br 续跑地址
 ```
 
-这段汇编序列经过**真机验证**,一字未改。
+**为什么要存这么多**:`DobbyHook` 是纯跳转 hook,不替我们保存任何 CPU 状态;而 hook 点落在
+**函数中间**,不是函数调用边界 —— 这里没有任何 ABI 保护,原代码此刻持有的一切都得原样还回去。
+
+- **NZCV(条件标志位)**:`trace_ctx_entry` 里的 C 代码(表达式求值、`memcmp`、字符串搜索)
+  必然改写它。不恢复的话,原代码紧跟着的 `b.eq`/`cbz` 会基于被污染的标志位跳转 ——
+  **如果那正好是循环的退出判断,程序就永远出不来**。真机上表现为:同一个函数被反复执行
+  上百万次、寄存器和数据一直不变,看着像死锁,其实是控制流被带偏了。
+- **q0-q31(向量寄存器)**:C 里的 `memcpy`/`memcmp`/字符串操作大量用 NEON。ABI 只保证
+  v8-v15 的**低 64 位**由 callee 保护,而原代码在指令中间可能正拿着任意 v 寄存器存中间值。
+- **FPCR/FPSR**:改动概率低,但既然要"原样还回去"就一起存。
+
+栈布局(共 `0x320` 字节,`TraceRegFile` 仍在 `sp+0` 开头 `0x100` 字节,结构不变):
+
+```
+sp+0x000..0x0FF  x0..x28 / fp / lr / 真实sp   ← TraceRegFile
+sp+0x100         NZCV
+sp+0x108         FPCR
+sp+0x110         FPSR
+sp+0x120..0x31F  q0..q31
+```
+
+恢复顺序有讲究:`msr nzcv` 排在恢复通用寄存器**之前**(借 x9 当临时寄存器),因为之后的
+`ldp`/`ldr`/`mov sp`/`br` 都不碰标志位,而 x9 随后会被还原成原值。
+
+> 这段汇编改动前必须反汇编核对(`otool -tV`),32 个槽位都要逐个确认 —— 见 HANDOFF.md。
 
 ### 4.3 记录后原生续跑(关键设计)
 
@@ -74,11 +99,112 @@ QBDI 在**虚拟栈**上执行被 trace 的代码(用真实栈会让 QBDI 引擎
 
 代价:被 trace 的区域执行两遍(QBDI 记录一遍 + 原生一遍)。对纯计算函数(签名计算)无害。
 
+### 4.3.1 为什么 trace 区间必须 ≥ 0x10 字节
+
+`qbdi_run(vm, entry, end)` 靠 **PC == end** 停,而 `end` 是**模块里的真实地址**。
+Dobby 的补丁覆盖 `[start, start+QBDI_PATCH_SIZE)`(0x10 字节),这段的原指令被搬到
+origin trampoline —— QBDI 执行的是那份副本,副本地址永远不等于模块里的 `end`。
+
+所以 `end` 一旦落在补丁区内(`end - start < 0x10`):
+
+1. 副本跑完,origin 末尾的跳回桩直接跳到 `start + 0x10`,**跨过了** `end`
+2. stopAddr 永不命中
+3. 兜底也常常失效(`run_trace` 里设了 `state->lr = end`,想让"提前 ret"跳回 end 停下,
+   但区域里只要有一条 `BL`,LR 当场就被覆盖了)
+4. 于是一路执行完整个函数、跑进所有被调函数,撞上 syscall / objc 快速路径 /
+   C++ 异常这类 QBDI 不处理的东西 → SIGSEGV
+
+这种配置**必然**跑飞,所以 `engine.m` 的 `load_watches` 之前和 `trace()` 入口都直接拒掉,
+`TraceEditVC` 的「完成」也挡一道。想看某条指令附近的数据,应该用 watch,而不是缩小 trace 区间。
+
+### 4.3.2 触发条件(按内存内容决定这次要不要 trace)
+
+同一个 hook 点常常被调用很多次,只有少数几次携带你要的数据(其余可能是 `0x0`)。
+`count` 是"前 N 次",挡不住这种情况 —— 第一次的垃圾数据就把次数消耗掉了。
+
+所以 trace 条目可以带一个**触发条件**:
+
+```
+hook 命中 → 求值 triggerExpr(用 hook 点的输入寄存器) → 匹配?
+    不匹配 → 计数 +1,直接 return origin(不写日志、不减 count、不启动 QBDI)
+    匹配   → 照常 run_trace
+```
+
+判断点在 `trace_ctx_entry` 里、`g_remaining[idx]` 递减**之前** —— 这是关键:
+那一刻一行日志都还没写、次数也没动,所以"不匹配"可以做到完全没有副作用。
+
+四种匹配方式(`TrigMatch`)× 两种位置(`TrigWhere`),都在 `config.h`:
+
+| 方式 | 期望值 | 比较 |
+|---|---|---|
+| `notnull` | — | 地址可读且非 0。**光这一条就能滤掉所有 `(null)` 的调用** |
+| `bytes` | `08a48c90` | 字节序列,按**内存顺序**(与 hexdump 所见一致),上限 32 字节 |
+| `cstr` | `api` | C 字符串 |
+| `u64` | `0x02100481908ca408` | 读 8 字节按小端当整数,相等 |
+
+位置(只对 `bytes`/`cstr` 有意义,缺省 **cstr=包含、bytes=开头**):
+
+| 位置 | 读多少 | 怎么比 |
+|---|---|---|
+| `prefix` | 只读期望值那么长 | 逐字节相等 |
+| `contains` | 最多 `triggerScan` 字节(cstr 再按第一个 `\0` 截断) | 在里面搜子串 |
+
+`bytes` 和 `u64` 对同一块内存的写法是**反的**(前者是内存顺序,后者是小端整数),
+界面 footer 里有提示。表达式和期望值都在配置加载期编译/解析好,运行期只做比较。
+比较逻辑单独拆成了 `trig_compare()`(不碰内存、不依赖 mach),所以能在 mac 上提取出来测。
+
+`triggerScan` 默认 `0x100`、硬上限 `TRIG_MAX_SCAN = 0x1000`。窗口配得比期望值还短时
+**加载期直接拒**(否则永远搜不到,却看不出为什么)。
+
+**性能**:`contains` 几乎不比 `prefix` 慢 —— 成本在 **mach trap 次数**而不是读取字节数。
+两者都是「1 次解引用 + 1 次读」共 2 次 trap;窗口一次读满(不像 `watch_read_string`
+那样每 64 字节一趟),多出来的只是内存里的朴素搜索。这段代码在**每次 hook 命中**都跑,
+所以 trap 次数是唯一要控的东西。
+
+`vm_read_overwrite` 有个坑:读取范围末尾一旦跨到未映射页,**整块调用失败返回 0**。
+所以 `trigger_read()` 在整块失败时退一步、只读到本页末尾 —— 否则窗口设大一点就什么都读不到。
+
+**限制**:条件只能用 hook 点(`static_start`)的寄存器状态。`TraceRegFile` 里没有 pc,
+表达式里写 `pc` 会得到 hook 点地址。如果需要"区间中间某条指令时的状态"才能判断,
+得改成边 trace 边缓冲日志、判断点之后再决定 flush/丢弃 —— 复杂度高一档,暂未做。
+
+**条件配错时拒绝整条 trace**(而不是退化成无条件):过滤静默失效会给出一堆本该被滤掉的
+日志,而用户以为条件在生效,比不 trace 更误导。
+
+日志上不改动现有格式,只加行。不匹配时按**指数退避**打诊断 —— 第 1/10/100/1000/… 次
+各打一次,内容是"表达式算出的地址 + 实际读到的数据 + 期望值":
+
+```
+[MusicallyCore] trigger miss #1: [x2+0x10] = 0x280691000
+    want: bytes prefix 08a48c90
+    got : 0000000028043...  (read 0x4 bytes)
+```
+
+取址失败时改为打逐级 `deref#N` 链(复用 `wexpr_print_trace`)。这样"地址不对"和
+"期望值写法不对"一眼能分清 —— 早期版本每 100 次只打一个计数,热点上写了 52 万行
+却什么信息都没有,排查全靠猜。
+
+命中时在 `==== trace#N enter ====` 之前写一行 `trigger matched (bytes prefix)
+after N filtered calls`。
+
+次数用完后**不再求值条件**(否则 trace 早结束了,过滤统计还会一直往日志里长)。
+
 ### 4.4 watch(监视点)
 
-除了逐指令 trace,可在指定地址读某个寄存器指向的内存(`qbdi_trace.c` 的 `watch_handle`):
+除了逐指令 trace,可在指定地址读一个**算出来的地址**指向的内存(`qbdi_trace.c` 的 `watch_handle`):
 - 用 `vm_read_overwrite` **安全读**(野指针不崩,返回 `(not a pointer)`)
-- action:`cstr`/`utf8`(size=0 读到 \0 不截断)、`u32`/`u64`、`hexdump`、`objc`(校验 isa 后当 ObjC 对象解析)
+- action:`cstr`/`utf8`(size=0 读到 \0 不截断)、`u32`/`u64`、`hexdump`(上限 64KB)、`objc`(校验 isa 后当 ObjC 对象解析)
+
+**取址方式**有两种,`expr` 优先于 `reg`:
+- `reg`:直接取某个寄存器的值(`x0`..`x28`/`fp`/`lr`/`sp`)
+- `expr`:取址表达式,支持 `寄存器 ± 十六进制常量` 与 `[]` 多级解引用,如 `x0-0x110`、`sp+0x40`、`[[x0+8]+0x10]-4`
+
+表达式由 `watch_expr.c` 实现,设计上有两个关键点:
+
+1. **在配置加载期编译,不在命中时解析**(`engine.m` 的 `load_watches` 调 `wexpr_compile`,结果存进 `TraceWatch.cexpr`)。编译产物是一段最多 24 步的后缀式,命中时只跑这几步。这样做的主要收益不是性能,而是**语法错误在 app 启动时就能写进日志** —— 否则配错了的表现和"没命中"一模一样,没法排查。
+2. **表达式算出的是"地址",最后一次解引用交给 action**。于是 `expr="x0"` 与旧配置 `reg="x0"` 行为完全一致,老配置不需要迁移;而 `[x0+0x10]` 配 `cstr` 自然就是"读结构体里那个 `char*` 字段"。
+
+多级指针失败时会把每一级的地址和读取结果都打进日志(`wexpr_print_trace`),否则三级解引用只报一句"读不出来"等于没有信息。
 
 ## 5. 运行期配置(核心设计)
 
@@ -110,10 +236,21 @@ QBDI 在**虚拟栈**上执行被 trace 的代码(用真实栈会让 QBDI 引擎
       "count": 1,                     // trace 次数,之后透传
       "moduleOnly": true,             // 1=只记录模块内指令
       "delaySecs": 10,                // 本条目延迟多少秒装 hook
-      "logMask": 1,                   // LOG_INST=1 MEM=2 REGS=4 BRANCH=8 VREG=16 位或
+      "logMask": 17,                  // LOG_INST=1 MEM=2 REGS=4 BRANCH=8 VREG=16 位或
+                                      // 界面已不再暴露这一栏,新建/编辑后统一写 17
+                                      // (INST|VREG);引擎照旧按字段值跑,旧配置不受影响
+      "triggerExpr": "[x2+0x10]",     // 触发条件:留空/缺失 = 无条件(默认)
+      "triggerMatch": "bytes",        // notnull | bytes | cstr | u64
+      "triggerValue": "08a48c90",     // bytes 按内存顺序;u64 是小端整数;notnull 不用填
+      "triggerWhere": "prefix",       // prefix | contains(缺省:cstr=contains,bytes=prefix)
+      "triggerScan": "0x100",         // contains 的读取上限,默认 0x100、最大 0x1000
       "watches": [
         { "module": "ModuleName", "offset": "0x27A1F4E8",
-          "reg": "x0", "action": "cstr", "size": 0, "label": "url" }
+          "reg": "x0", "action": "cstr", "size": "0x0", "label": "url" },
+        { "module": "ModuleName", "offset": "0x27A1F4E8",
+          "reg": "x0",                    // 基寄存器,给旧版引擎留的退路
+          "expr": "[[x0+8]+0x10]-4",      // 取址表达式,存在时优先于 reg
+          "action": "hexdump", "size": "0x110", "label": "hdr" }
       ]
     }
   ]
@@ -121,6 +258,8 @@ QBDI 在**虚拟栈**上执行被 trace 的代码(用真实栈会让 QBDI 引擎
 ```
 
 **地址是相对模块基址的偏移**,和 Frida `module_base.add(x)` 一致 —— 不是绝对 VA,不要加 slide。引擎用 `_dyld_get_image_header` 取运行时基址(已含 slide)。
+
+**`size` 的进制看前缀**:`"0x110"` = 272,`"110"` = 110(十进制),裸数字 `272` = 272。旧配置里 size 是十进制数字,新 App 写出来一律是 `"0x..."` 字符串,靠前缀区分,不需要迁移。`start`/`end`/`offset` 则一律按十六进制解(带不带 `0x` 都一样)。
 
 ## 6.5 导出 / 导入
 

@@ -3,7 +3,27 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "qbdi_trace.h" /* LOG_* */
+#include "qbdi_trace.h"  /* LOG_* */
+#include "watch_expr.h"  /* WatchExpr */
+
+/* 触发条件的匹配方式 */
+typedef enum {
+    TRIG_NONE = 0, /* 无条件(默认):每次命中都 trace */
+    TRIG_NOTNULL,  /* 地址可读且非 0 */
+    TRIG_BYTES,    /* 字节序列(按内存顺序,与 hexdump 所见一致) */
+    TRIG_CSTR,     /* C 字符串(读到 \0 为止) */
+    TRIG_U64,      /* 读 8 字节(小端)等于 want_u64 */
+} TrigMatch;
+
+/* 期望值出现在哪儿(只对 TRIG_BYTES / TRIG_CSTR 有意义) */
+typedef enum {
+    TRIG_AT_PREFIX = 0, /* 开头:只读期望值那么长,逐字节比 */
+    TRIG_AT_CONTAINS,   /* 包含:读最多 scan 字节(cstr 读到 \0),在里面搜 */
+} TrigWhere;
+
+#define TRIG_MAX_BYTES 32     /* 期望值最长 32 字节 */
+#define TRIG_MAX_SCAN  0x1000 /* 「包含」的搜索窗口硬上限 4KB */
+#define TRIG_DEF_SCAN  0x100  /* 默认窗口 256 字节 */
 
 /* 一条 trace 区间(运行期由 engine.m 从 JSON 填充) */
 typedef struct {
@@ -14,14 +34,27 @@ typedef struct {
     int         count;        /* trace 次数:前 count 次执行 trace,之后透传 */
     int         delay_secs;   /* 本条目启动后延迟多少秒装 hook(0 = 立即) */
     uint64_t    log_mask;     /* LOG_INST|LOG_MEM|LOG_REGS|LOG_BRANCH */
+
+    /* 触发条件:在 hook 点(static_start)用输入寄存器求值,不匹配就透传 ——
+     * 不写日志、不消耗 count、不启动 QBDI。TRIG_NONE 时下面的字段都无意义。 */
+    const char *trigger_expr;                    /* 表达式原文(仅用于日志) */
+    WatchExpr   trigger_cexpr;                   /* 编译后的取址表达式 */
+    TrigMatch   trigger_match;
+    TrigWhere   trigger_where;                   /* 开头 / 包含 */
+    uint32_t    trigger_scan;                    /* 「包含」的读取上限,≤ TRIG_MAX_SCAN */
+    uint8_t     want_bytes[TRIG_MAX_BYTES];      /* TRIG_BYTES/TRIG_CSTR 的期望内容 */
+    int         want_nbytes;
+    uint64_t    want_u64;                        /* TRIG_U64 的期望值 */
 } TraceSpec;
 
 typedef struct {
     const char *module;   /* dyld 镜像名子串 */
     uint64_t    offset;   /* 静态偏移(相对模块基址) */
-    const char *reg;      /* x0..x28, fp, lr, sp */
+    const char *reg;      /* x0..x28, fp, lr, sp —— 无 expr 时的取址来源 */
+    const char *expr;     /* 取址表达式原文(可为 NULL),如 "[[x0+8]+0x10]-4" */
+    WatchExpr   cexpr;    /* expr 的编译结果;nops > 0 时优先于 reg */
     const char *action;   /* cstr|utf8|u32|u64|hexdump|objc|po|其它=仅打印值 */
-    uint32_t    size;     /* cstr/utf8 读取上限、hexdump 长度;0=不截断 */
+    uint32_t    size;     /* cstr/utf8 读取上限、hexdump 长度(十六进制);0=不截断 */
     const char *label;    /* 可选标签 */
 } TraceWatch;
 

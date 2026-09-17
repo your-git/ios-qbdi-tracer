@@ -1,4 +1,5 @@
 #import "AppDelegate.h"
+#import "NavController.h"
 #import "RootListVC.h"
 
 @implementation AppDelegate
@@ -7,8 +8,9 @@
     didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     RootListVC *root = [[RootListVC alloc] initWithStyle:UITableViewStyleInsetGrouped];
-    UINavigationController *nav =
-        [[UINavigationController alloc] initWithRootViewController:root];
+    /* NavController 而非 UINavigationController:编辑页要能拦住系统返回按钮 */
+    NavController *nav =
+        [[NavController alloc] initWithRootViewController:root];
     self.window.rootViewController = nav;
     [self.window makeKeyAndVisible];
     return YES;

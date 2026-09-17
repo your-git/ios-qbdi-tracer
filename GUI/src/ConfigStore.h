@@ -3,8 +3,11 @@
 /* 配置读写:与引擎 engine.m 同一路径、同一 JSON schema。
  * 顶层: { enabled: bool, items: [ item... ] }
  * item:  { id, enabled, bundleId, appName, module, start, end, count,
- *          moduleOnly, delaySecs, logMask, watches: [ watch... ] }
- * watch: { module, offset, reg, action, size, label } */
+ *          moduleOnly, delaySecs, logMask,
+ *          triggerExpr, triggerMatch, triggerValue,
+ *          triggerWhere, triggerScan,                 // 触发条件(可选)
+ *          watches: [ watch... ] }
+ * watch: { module, offset, reg, expr, action, size, label } */
 @interface ConfigStore : NSObject
 
 + (instancetype)shared;

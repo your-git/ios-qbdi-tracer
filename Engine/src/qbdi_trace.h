@@ -33,6 +33,9 @@ typedef struct {
 /* 自动 hook 每目标的运行时状态(次数用完透传) */
 extern void *g_origin[TRACE_MAX_TARGETS];
 extern int g_remaining[TRACE_MAX_TARGETS];
+/* 装 hook 时算好的模块运行时基址。**别在命中时重新 find_module** ——
+ * 那会遍历所有 dyld 镜像做 strstr 并抢 dyld 锁,热点上足以把整个进程拖死。 */
+extern uint64_t g_module_base[TRACE_MAX_TARGETS];
 void qbdi_trace_init_state(void);
 
 /* asm trampoline 调用的入口:对第 idx 个目标做一次 trace 或透传。

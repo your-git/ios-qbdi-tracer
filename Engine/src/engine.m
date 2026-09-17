@@ -62,6 +62,27 @@ static uint64_t parse_hex(id v) {
     return (uint64_t)strtoull(s, NULL, 16);
 }
 
+/* size 字段专用:带 "0x" 前缀按十六进制,不带按十进制。
+ * 旧配置里 size 是裸十进制数字(NSNumber),新 App 写出来一律是 "0x..." 字符串,
+ * 两者靠前缀区分,不用迁移。 */
+static uint64_t parse_size(id v) {
+    if ([v isKindOfClass:[NSNumber class]]) {
+        return (uint64_t)[v unsignedLongLongValue];
+    }
+    if (![v isKindOfClass:[NSString class]]) {
+        return 0;
+    }
+    const char *s = [v UTF8String];
+    if (s == NULL) {
+        return 0;
+    }
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    bool hex = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'));
+    return (uint64_t)strtoull(hex ? s + 2 : s, NULL, hex ? 16 : 10);
+}
+
 static int parse_int(id v, int dflt) {
     if ([v isKindOfClass:[NSNumber class]]) {
         return [v intValue];
@@ -88,6 +109,147 @@ static const char *dup_str(id v) {
     return s ? strdup(s) : NULL;
 }
 
+/* 解析触发条件。返回 false = 配置有问题(调用方应拒绝整条 trace,而不是退化成无条件 ——
+ * 过滤静默失效会给一堆本该被滤掉的日志,比不 trace 更误导)。err 写人可读原因。 */
+static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errcap) {
+    t->trigger_match = TRIG_NONE;
+    t->trigger_where = TRIG_AT_PREFIX;
+    t->trigger_scan  = TRIG_DEF_SCAN;
+    t->trigger_expr  = NULL;
+    t->want_nbytes   = 0;
+    t->want_u64      = 0;
+    memset(&t->trigger_cexpr, 0, sizeof(t->trigger_cexpr));
+
+    const char *expr = dup_str(it[@"triggerExpr"]);
+    if (expr == NULL) {
+        return true; /* 没配条件:无条件 trace,和以前一样 */
+    }
+
+    if (!wexpr_compile(expr, &t->trigger_cexpr, err, errcap)) {
+        return false;
+    }
+    t->trigger_expr = expr;
+
+    NSString *m = [it[@"triggerMatch"] isKindOfClass:[NSString class]]
+                      ? it[@"triggerMatch"] : @"notnull";
+    NSString *v = [it[@"triggerValue"] isKindOfClass:[NSString class]]
+                      ? it[@"triggerValue"] : @"";
+
+    /* 期望值出现在哪儿。缺省按直觉给:字符串=包含,字节=开头 */
+    NSString *w = it[@"triggerWhere"];
+    if ([w isKindOfClass:[NSString class]] && [w length] > 0) {
+        if ([w isEqualToString:@"contains"]) {
+            t->trigger_where = TRIG_AT_CONTAINS;
+        } else if ([w isEqualToString:@"prefix"]) {
+            t->trigger_where = TRIG_AT_PREFIX;
+        } else {
+            snprintf(err, errcap, "unknown triggerWhere \"%s\"", [w UTF8String]);
+            return false;
+        }
+    } else {
+        t->trigger_where =
+            [m isEqualToString:@"cstr"] ? TRIG_AT_CONTAINS : TRIG_AT_PREFIX;
+    }
+
+    /* 「包含」的读取上限(与 size 同规则:带 0x = 十六进制,不带 = 十进制) */
+    if (it[@"triggerScan"] != nil) {
+        uint64_t sc = parse_size(it[@"triggerScan"]);
+        if (sc == 0) {
+            sc = TRIG_DEF_SCAN;
+        }
+        if (sc > TRIG_MAX_SCAN) {
+            snprintf(err, errcap, "triggerScan 0x%llx exceeds max 0x%x",
+                     (unsigned long long)sc, TRIG_MAX_SCAN);
+            return false;
+        }
+        t->trigger_scan = (uint32_t)sc;
+    }
+
+    if ([m isEqualToString:@"notnull"]) {
+        t->trigger_match = TRIG_NOTNULL;
+        return true;
+    }
+    if ([m isEqualToString:@"u64"]) {
+        t->trigger_match = TRIG_U64;
+        t->want_u64 = parse_hex(v); /* 一律十六进制,与 offset 同规则 */
+        return true;
+    }
+    if ([m isEqualToString:@"cstr"]) {
+        const char *s = [v UTF8String];
+        size_t n = s ? strlen(s) : 0;
+        if (n == 0 || n > TRIG_MAX_BYTES) {
+            snprintf(err, errcap, "cstr value must be 1..%d bytes", TRIG_MAX_BYTES);
+            return false;
+        }
+        memcpy(t->want_bytes, s, n);
+        t->want_nbytes = (int)n;
+        t->trigger_match = TRIG_CSTR;
+        if (t->trigger_where == TRIG_AT_CONTAINS && t->trigger_scan < n) {
+            snprintf(err, errcap,
+                     "triggerScan 0x%x is smaller than the %zu-byte needle",
+                     t->trigger_scan, n);
+            return false;
+        }
+        return true;
+    }
+    if ([m isEqualToString:@"bytes"]) {
+        /* "08a48c90" / "08 a4 8c 90":忽略空白,按内存顺序存 */
+        const char *s = [v UTF8String];
+        if (s == NULL) {
+            snprintf(err, errcap, "bytes value missing");
+            return false;
+        }
+        int hi = -1, n = 0;
+        for (; *s; s++) {
+            if (*s == ' ' || *s == '\t' || *s == ':' || *s == ',') {
+                continue;
+            }
+            int d;
+            char c = (*s >= 'A' && *s <= 'Z') ? (char)(*s - 'A' + 'a') : *s;
+            if (c >= '0' && c <= '9') {
+                d = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                d = c - 'a' + 10;
+            } else {
+                snprintf(err, errcap, "bytes value has non-hex char '%c'", *s);
+                return false;
+            }
+            if (hi < 0) {
+                hi = d;
+            } else {
+                if (n >= TRIG_MAX_BYTES) {
+                    snprintf(err, errcap, "bytes value longer than %d bytes",
+                             TRIG_MAX_BYTES);
+                    return false;
+                }
+                t->want_bytes[n++] = (uint8_t)((hi << 4) | d);
+                hi = -1;
+            }
+        }
+        if (hi >= 0) {
+            snprintf(err, errcap, "bytes value needs an even number of hex digits");
+            return false;
+        }
+        if (n == 0) {
+            snprintf(err, errcap, "bytes value is empty");
+            return false;
+        }
+        t->want_nbytes = n;
+        t->trigger_match = TRIG_BYTES;
+        /* 窗口比要找的东西还短,那永远搜不到 —— 拦下来,别让它静默不匹配 */
+        if (t->trigger_where == TRIG_AT_CONTAINS && (int)t->trigger_scan < n) {
+            snprintf(err, errcap,
+                     "triggerScan 0x%x is smaller than the %d-byte needle",
+                     t->trigger_scan, n);
+            return false;
+        }
+        return true;
+    }
+
+    snprintf(err, errcap, "unknown triggerMatch \"%s\"", [m UTF8String]);
+    return false;
+}
+
 /* 把一条 item 的 watches 填进全局 g_watches */
 static void load_watches(NSArray *warr) {
     if (![warr isKindOfClass:[NSArray class]]) {
@@ -101,13 +263,25 @@ static void load_watches(NSArray *warr) {
             break;
         }
         TraceWatch *dst = &g_watches[g_watch_count];
+        memset(dst, 0, sizeof(*dst));
         dst->module = dup_str(w[@"module"]);
         dst->offset = parse_hex(w[@"offset"]);
         dst->reg    = dup_str(w[@"reg"]);
+        dst->expr   = dup_str(w[@"expr"]);
         dst->action = dup_str(w[@"action"]);
-        dst->size   = (uint32_t)parse_int(w[@"size"], 0);
+        dst->size   = (uint32_t)parse_size(w[@"size"]);
         dst->label  = dup_str(w[@"label"]);
-        if (dst->module == NULL || dst->reg == NULL) {
+        if (dst->expr != NULL) {
+            /* 加载期就编译:语法错误此刻进日志,不会表现成"watch 没有任何输出" */
+            char err[96];
+            if (!wexpr_compile(dst->expr, &dst->cexpr, err, sizeof(err))) {
+                qbdi_trace_logf("[watch] bad expr \"%s\": %s (falling back to reg %s)\n",
+                                dst->expr, err, dst->reg ? dst->reg : "(none)");
+                dst->cexpr.nops = 0;
+                dst->expr       = NULL;
+            }
+        }
+        if (dst->module == NULL || (dst->reg == NULL && dst->expr == NULL)) {
             continue; /* 丢弃无效行,不递增 count */
         }
         g_watch_count++;
@@ -126,6 +300,9 @@ static void install_slot(int slot) {
     void *origin = NULL;
     int rc = DobbyHook(target, (void *)g_tramps[slot], &origin);
     if (rc == 0 && origin != NULL) {
+        /* 基址在这里存好:trace_ctx_entry 每次命中都要用,不能让它自己去
+         * find_module(遍历 dyld 镜像 + 抢 dyld 锁,热点上会拖死整个进程) */
+        g_module_base[slot] = base;
         g_origin[slot] = origin;
         qbdi_trace_logf("[engine] hooked %s+0x%llx @ %p (slot %d, origin=%p)\n",
                         t->module, (unsigned long long)t->static_start, target,
@@ -224,6 +401,35 @@ void engine_start(void) {
                 qbdi_trace_logf("[engine] skip invalid item (slot %d)\n", slot);
                 memset(t, 0, sizeof(*t));
                 continue;
+            }
+            /* 区间短于 Dobby 补丁长度时,end 落在 [start, start+0x10) 里 —— 那几条指令
+             * 在真实内存里已被补丁覆盖,QBDI 跑的是 origin 里的副本,PC 永远不会等于 end,
+             * 于是停不下来、一路执行到崩。这种配置必须拒掉,不能让它跑。 */
+            if (t->static_end - t->static_start < QBDI_PATCH_SIZE) {
+                qbdi_trace_logf("[engine] skip item (slot %d): range 0x%llx too short, "
+                                "end must be >= start + 0x%x (Dobby patch covers "
+                                "[start, start+0x%x))\n",
+                                slot,
+                                (unsigned long long)(t->static_end - t->static_start),
+                                QBDI_PATCH_SIZE, QBDI_PATCH_SIZE);
+                memset(t, 0, sizeof(*t));
+                continue;
+            }
+            char terr[96];
+            if (!load_trigger(it, t, terr, sizeof(terr))) {
+                /* 条件配错就拒整条:否则过滤静默失效,日志里全是本该被滤掉的内容 */
+                qbdi_trace_logf("[engine] skip item (slot %d): bad trigger: %s\n",
+                                slot, terr);
+                memset(t, 0, sizeof(*t));
+                continue;
+            }
+            if (t->trigger_match != TRIG_NONE) {
+                qbdi_trace_logf("[%s] trigger: %s (%s)\n", t->module,
+                                t->trigger_expr,
+                                t->trigger_match == TRIG_NOTNULL ? "notnull"
+                                : t->trigger_match == TRIG_BYTES ? "bytes"
+                                : t->trigger_match == TRIG_CSTR  ? "cstr"
+                                                                 : "u64");
             }
             load_watches(it[@"watches"]);
             g_trace_count++;

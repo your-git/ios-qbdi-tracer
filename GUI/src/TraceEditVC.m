@@ -1,6 +1,8 @@
 #import "TraceEditVC.h"
 #import "ConfigStore.h"
 #import "WatchEditVC.h"
+#import "ExprInput.h"
+#import "HexValue.h"
 #import <objc/runtime.h>
 
 /* 带右侧输入框的 cell */
@@ -28,6 +30,15 @@
 }
 @end
 
+/* logMask 那一栏已从界面上去掉,统一用「指令 + 向量寄存器」。
+ * 字段本身保留在 JSON 里(引擎照旧读它),只是不再让用户选。 */
+#define TRACE_DEFAULT_LOGMASK 17 /* LOG_INST(1) | LOG_VREG(16) */
+
+/* trace 区间下限:Dobby 的补丁覆盖 [start, start+0x10),区间比它短的话
+ * end 落在补丁区里,QBDI 永远跑不到 end,会一路执行到崩(见 DESIGN.md §4.4)。
+ * 与 Engine/src/qbdi_trace.h 的 QBDI_PATCH_SIZE 对应。 */
+#define TRACE_MIN_RANGE 0x10
+
 @interface TraceEditVC () <UITextFieldDelegate>
 @property (nonatomic, strong) NSMutableDictionary *item;
 @property (nonatomic, assign) BOOL isNew;
@@ -47,13 +58,30 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = _isNew ? @"添加 Trace" : @"编辑 Trace";
-    /* 统一行高:所有 cell(输入框行 / 开关行 / 多选行)一样高,舒展一点 */
+    /* 统一行高:所有 cell(输入框行 / 开关行)一样高,舒展一点 */
     self.tableView.rowHeight = 52.0;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
         initWithTitle:@"完成"
                 style:UIBarButtonItemStyleDone
                target:self
                action:@selector(done)];
+
+    /* 先把字段规范化(logMask 统一成默认值、数字字段统一成 NSNumber),再拍快照 —— */
+    /* 顺序反了会把这些自动改写当成"用户改了东西",一返回就误弹「放弃修改」 */
+    self.item[@"logMask"] = @(TRACE_DEFAULT_LOGMASK);
+    for (NSString *k in @[ @"count", @"delaySecs" ]) {
+        id v = self.item[k];
+        if (![v isKindOfClass:[NSNumber class]]) {
+            self.item[k] = @([v respondsToSelector:@selector(integerValue)]
+                                 ? [v integerValue] : 0);
+        }
+    }
+    [self beginEditingTarget:self.item];
+}
+
+/* watch 的改动不跟着 trace 一起回滚:在 watch 页点过「确定」就算定了 */
+- (NSSet<NSString *> *)snapshotExcludedKeys {
+    return [NSSet setWithObject:@"watches"];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -61,9 +89,241 @@
     [self.tableView reloadData];
 }
 
+#pragma mark - 触发条件
+
+/* 与 JSON 里 triggerMatch 的取值一一对应(引擎侧是 Engine/src/config.h 的 TrigMatch) */
+typedef NS_ENUM(NSInteger, TrigMatchKind) {
+    TrigMatchNotNull = 0,
+    TrigMatchBytes,
+    TrigMatchCstr,
+    TrigMatchU64,
+};
+
+static NSString *TrigMatchKey(TrigMatchKind k) {
+    switch (k) {
+        case TrigMatchBytes: return @"bytes";
+        case TrigMatchCstr:  return @"cstr";
+        case TrigMatchU64:   return @"u64";
+        case TrigMatchNotNull: break;
+    }
+    return @"notnull";
+}
+
+static NSString *TrigMatchLabel(TrigMatchKind k) {
+    switch (k) {
+        case TrigMatchBytes: return @"字节";
+        case TrigMatchCstr:  return @"字符串";
+        case TrigMatchU64:   return @"u64";
+        case TrigMatchNotNull: break;
+    }
+    return @"非空";
+}
+
+/* 期望值出现在哪儿 */
+typedef NS_ENUM(NSInteger, TrigWhereKind) {
+    TrigWherePrefix = 0,
+    TrigWhereContains,
+};
+
+/* 「触发条件」段的行(顺序即显示顺序,按匹配方式伸缩) */
+typedef NS_ENUM(NSInteger, TrigRowKind) {
+    TrigRowExpr = 0,
+    TrigRowMatch,
+    TrigRowWhere,
+    TrigRowValue,
+    TrigRowScan,
+};
+
+#define TRIG_SCAN_DEFAULT 0x100  /* 同 Engine/src/config.h 的 TRIG_DEF_SCAN */
+#define TRIG_SCAN_MAX     0x1000 /* 同 TRIG_MAX_SCAN */
+
+/* 配了取址表达式才算开了条件 */
+- (BOOL)hasTrigger {
+    id e = self.item[@"triggerExpr"];
+    return [e isKindOfClass:[NSString class]] && [e length] > 0;
+}
+
+- (TrigMatchKind)triggerMatch {
+    NSString *m = self.item[@"triggerMatch"];
+    if ([m isEqualToString:@"bytes"]) return TrigMatchBytes;
+    if ([m isEqualToString:@"cstr"])  return TrigMatchCstr;
+    if ([m isEqualToString:@"u64"])   return TrigMatchU64;
+    return TrigMatchNotNull;
+}
+
+/* 缺省按直觉给:字符串=包含,字节=开头(与引擎 load_trigger 一致) */
+- (TrigWhereKind)triggerWhere {
+    NSString *w = self.item[@"triggerWhere"];
+    if ([w isEqualToString:@"contains"]) return TrigWhereContains;
+    if ([w isEqualToString:@"prefix"])   return TrigWherePrefix;
+    return [self triggerMatch] == TrigMatchCstr ? TrigWhereContains
+                                                : TrigWherePrefix;
+}
+
+- (unsigned long long)triggerScan {
+    id v = self.item[@"triggerScan"];
+    if (v == nil) return TRIG_SCAN_DEFAULT;
+    unsigned long long n = HexValueFromJSON(v);
+    return n ? n : TRIG_SCAN_DEFAULT;
+}
+
+/* 当前该显示哪几行 */
+- (NSArray<NSNumber *> *)triggerRows {
+    if (![self hasTrigger]) {
+        return @[ @(TrigRowExpr) ];
+    }
+    TrigMatchKind k = [self triggerMatch];
+    if (k == TrigMatchNotNull) {
+        return @[ @(TrigRowExpr), @(TrigRowMatch) ];
+    }
+    if (k == TrigMatchU64) {
+        return @[ @(TrigRowExpr), @(TrigRowMatch), @(TrigRowValue) ];
+    }
+    /* 字节 / 字符串:多一个「匹配位置」,选了「包含」再多一个「最长读取」 */
+    NSMutableArray *rows = [@[ @(TrigRowExpr), @(TrigRowMatch), @(TrigRowWhere),
+                               @(TrigRowValue) ] mutableCopy];
+    if ([self triggerWhere] == TrigWhereContains) {
+        [rows addObject:@(TrigRowScan)];
+    }
+    return rows;
+}
+
+- (UITableViewCell *)triggerCellForRow:(NSInteger)row {
+    TrigRowKind kind =
+        (TrigRowKind)[[self triggerRows][row] integerValue];
+    TrigMatchKind k = [self triggerMatch];
+
+    if (kind == TrigRowValue) {
+        FieldCell *c = [self fieldCellKey:@"triggerValue"
+                                    label:@"期望值"
+                              placeholder:(k == TrigMatchBytes ? @"08a48c90"
+                                           : k == TrigMatchCstr ? @"api"
+                                                                : @"0x...")
+                                  numeric:NO];
+        c.field.font = [UIFont monospacedSystemFontOfSize:15
+                                                   weight:UIFontWeightRegular];
+        return c;
+    }
+    if (kind == TrigRowScan) {
+        FieldCell *c = [self fieldCellKey:@"triggerScan"
+                                    label:@"最长读取(0x)"
+                              placeholder:@"0x100"
+                                  numeric:NO];
+        c.field.font = [UIFont monospacedSystemFontOfSize:15
+                                                   weight:UIFontWeightRegular];
+        /* 缺省值也要显示出来,不然看着像没设置 */
+        c.field.text = [NSString stringWithFormat:@"0x%llx", [self triggerScan]];
+        return c;
+    }
+
+    UITableViewCell *c = [[UITableViewCell alloc]
+        initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+    if (kind == TrigRowExpr) {
+        c.textLabel.text = @"取址表达式";
+        NSString *e = self.item[@"triggerExpr"];
+        c.detailTextLabel.text = [e length] ? e : @"无条件";
+        c.detailTextLabel.font =
+            [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
+        c.detailTextLabel.adjustsFontSizeToFitWidth = YES;
+        c.detailTextLabel.minimumScaleFactor = 0.7;
+        if (![self hasTrigger]) {
+            c.detailTextLabel.textColor = [UIColor tertiaryLabelColor];
+        }
+    } else if (kind == TrigRowMatch) {
+        c.textLabel.text = @"匹配方式";
+        c.detailTextLabel.text = TrigMatchLabel(k);
+    } else {
+        c.textLabel.text = @"匹配位置";
+        c.detailTextLabel.text =
+            [self triggerWhere] == TrigWhereContains ? @"包含" : @"开头";
+    }
+    c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    return c;
+}
+
+- (void)pickTriggerWhere {
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"匹配位置"
+                         message:nil
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray *labels = @[ @"开头", @"包含" ];
+    NSArray *keys = @[ @"prefix", @"contains" ];
+    for (NSUInteger i = 0; i < labels.count; i++) {
+        NSString *key = keys[i];
+        [sheet addAction:[UIAlertAction actionWithTitle:labels[i]
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+                  self.item[@"triggerWhere"] = key;
+                  [self.tableView reloadData];
+                  [self updatePopGesture];
+              }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    sheet.popoverPresentationController.sourceView =
+        [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:2
+                                                                inSection:3]];
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+/* 点「取址表达式」那行:弹表达式输入框。清空 = 关掉条件。 */
+- (void)promptTriggerExpr {
+    __weak typeof(self) weakSelf = self;
+    ExprPrompt(self, self.item[@"triggerExpr"] ?: @"", ^(NSString *expr) {
+        typeof(self) me = weakSelf;
+        if (me == nil) return;
+        me.item[@"triggerExpr"] = expr;
+        /* 第一次开条件时给个默认匹配方式,省一步操作 */
+        if (me.item[@"triggerMatch"] == nil) {
+            me.item[@"triggerMatch"] = @"notnull";
+        }
+        [me.tableView reloadData];
+        [me updatePopGesture];
+    });
+}
+
+/* 表达式那行的左滑:清掉条件(ExprPrompt 里语法校验不让提交空串,所以单独给个入口) */
+- (void)clearTrigger {
+    [self.item removeObjectForKey:@"triggerExpr"];
+    [self.item removeObjectForKey:@"triggerMatch"];
+    [self.item removeObjectForKey:@"triggerValue"];
+    [self.item removeObjectForKey:@"triggerWhere"];
+    [self.item removeObjectForKey:@"triggerScan"];
+    [self.tableView reloadData];
+    [self updatePopGesture];
+}
+
+- (void)pickTriggerMatch {
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"匹配方式"
+                         message:nil
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    TrigMatchKind all[] = { TrigMatchNotNull, TrigMatchBytes, TrigMatchCstr,
+                            TrigMatchU64 };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        TrigMatchKind k = all[i];
+        [sheet addAction:[UIAlertAction actionWithTitle:TrigMatchLabel(k)
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+                  self.item[@"triggerMatch"] = TrigMatchKey(k);
+                  [self.tableView reloadData];
+                  [self updatePopGesture];
+              }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    sheet.popoverPresentationController.sourceView =
+        [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:1
+                                                                inSection:3]];
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
 #pragma mark - 字段布局
 
-/* section: 0=App 信息(只读) 1=地址 2=选项 3=logMask 4=watches */
+/* section: 0=App 信息(只读) 1=地址 2=选项 3=触发条件 4=watches
+ * (曾经的 logMask 多选段已去掉;改这里记得同步下面所有 section 判断) */
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
     return 5;
 }
@@ -74,8 +334,41 @@
         case 0: return @"目标 App";
         case 1: return @"模块与地址(十六进制)";
         case 2: return @"选项";
-        case 3: return @"记录内容(logMask)";
+        case 3: return @"触发条件(可选)";
         case 4: return @"监视(watch)";
+    }
+    return nil;
+}
+
+- (NSString *)tableView:(UITableView *)tableView
+    titleForFooterInSection:(NSInteger)section {
+    if (section == 1) {
+        return @"结束地址至少要比起始地址大 0x10。";
+    }
+    if (section == 3) {
+        if (![self hasTrigger]) {
+            return @"留空 = 每次命中都 trace。填了表达式后,只有内存内容匹配时才记录,"
+                   @"不匹配的调用完全不写日志、也不消耗 trace 次数。";
+        }
+        BOOL contains = [self triggerWhere] == TrigWhereContains;
+        if ([self triggerMatch] == TrigMatchBytes) {
+            return contains
+                ? @"从这个地址最多读「最长读取」个字节,在里面搜这串字节。"
+                  @"字节按内存顺序写 —— 和 hexdump 里看到的顺序一致。例:08a48c90"
+                : @"只比开头:读这串字节那么长,逐字节相等才算命中。"
+                  @"按内存顺序写,和 hexdump 里看到的一致。例:08a48c90";
+        }
+        if ([self triggerMatch] == TrigMatchCstr) {
+            return contains
+                ? @"先把字符串完整读出来(读到 \0 为止、最多「最长读取」个字节),"
+                  @"再看里面是否包含这段文字。"
+                : @"只比开头:字符串以这段文字开头才算命中。例:https://";
+        }
+        if ([self triggerMatch] == TrigMatchU64) {
+            return @"读 8 字节按小端当整数比较。注意和「字节」相反:"
+                   @"内存里的 08 a4 8c 90 81 04 10 02 在这里要写成 0x02100481908ca408。";
+        }
+        return @"地址可读且非 0 就算命中 —— 用来滤掉那些 (null) 的调用。";
     }
     return nil;
 }
@@ -86,7 +379,7 @@
         case 0: return 1;                 /* app 名 */
         case 1: return 3;                 /* module / start / end */
         case 2: return 3;                 /* count / delaySecs / moduleOnly */
-        case 3: return 5;                 /* INST/MEM/REGS/BRANCH/VREG */
+        case 3: return (NSInteger)[self triggerRows].count;
         case 4: return (NSInteger)[self.item[@"watches"] count] + 1; /* +添加 */
     }
     return 0;
@@ -135,16 +428,7 @@
         return c;
     }
     if (ip.section == 3) {
-        NSArray *names = @[ @"指令(INST)", @"内存(MEM)", @"寄存器(REGS)",
-                            @"仅分支(BRANCH)", @"向量寄存器(VREG)" ];
-        int bit = 1 << ip.row;
-        UITableViewCell *c = [[UITableViewCell alloc]
-            initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-        c.textLabel.text = names[ip.row];
-        int mask = [self.item[@"logMask"] intValue];
-        c.accessoryType = (mask & bit) ? UITableViewCellAccessoryCheckmark
-                                       : UITableViewCellAccessoryNone;
-        return c;
+        return [self triggerCellForRow:ip.row];
     }
     /* section 4: watches */
     NSArray *watches = self.item[@"watches"];
@@ -158,8 +442,10 @@
     NSDictionary *w = watches[ip.row];
     UITableViewCell *c = [[UITableViewCell alloc]
         initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    /* 有取址表达式就显示表达式,否则显示寄存器名 —— 否则配了表达式在列表里看不出来 */
+    NSString *addr = [w[@"expr"] length] ? w[@"expr"] : (w[@"reg"] ?: @"?");
     c.textLabel.text = [NSString stringWithFormat:@"%@ %@ %@",
-                        w[@"reg"] ?: @"?", w[@"action"] ?: @"",
+                        addr, w[@"action"] ?: @"",
                         [w[@"label"] length] ? w[@"label"] : @""];
     c.detailTextLabel.text = [NSString stringWithFormat:@"%@ @ %@",
                               w[@"module"] ?: @"", w[@"offset"] ?: @""];
@@ -196,12 +482,25 @@
 - (void)textFieldDidEndEditing:(UITextField *)tf {
     NSString *key = objc_getAssociatedObject(tf, "cfgKey");
     if (key == nil) return;
+    if ([key isEqualToString:@"triggerScan"]) {
+        /* 一律按十六进制读,写回时带 0x —— 与 watch 的 size 同一套规则 */
+        unsigned long long n = 0;
+        if (HexParseInput(tf.text, &n) && n > 0) {
+            if (n > TRIG_SCAN_MAX) n = TRIG_SCAN_MAX;
+            self.item[key] = [NSString stringWithFormat:@"0x%llx", n];
+        }
+        /* 非法/空就回填上次的合法值,不静默变 0 */
+        tf.text = [NSString stringWithFormat:@"0x%llx", [self triggerScan]];
+        [self updatePopGesture];
+        return;
+    }
     BOOL numeric = [objc_getAssociatedObject(tf, "numeric") boolValue];
     if (numeric) {
         self.item[key] = @([tf.text integerValue]);
     } else {
         self.item[key] = tf.text ?: @"";
     }
+    [self updatePopGesture];
 }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)tf {
@@ -211,6 +510,7 @@
 
 - (void)moduleOnlyChanged:(UISwitch *)sw {
     self.item[@"moduleOnly"] = @(sw.on);
+    [self updatePopGesture];
 }
 
 #pragma mark - 选择
@@ -220,12 +520,12 @@
     [tableView deselectRowAtIndexPath:ip animated:YES];
 
     if (ip.section == 3) {
-        /* 切 logMask 位 */
-        int bit = 1 << ip.row;
-        int mask = [self.item[@"logMask"] intValue] ^ bit;
-        self.item[@"logMask"] = @(mask);
-        [tableView reloadRowsAtIndexPaths:@[ ip ]
-                         withRowAnimation:UITableViewRowAnimationNone];
+        switch ((TrigRowKind)[[self triggerRows][ip.row] integerValue]) {
+            case TrigRowExpr:  [self promptTriggerExpr]; break;
+            case TrigRowMatch: [self pickTriggerMatch]; break;
+            case TrigRowWhere: [self pickTriggerWhere]; break;
+            default: break; /* 输入框行,不用处理点击 */
+        }
         return;
     }
 
@@ -234,9 +534,10 @@
         NSMutableDictionary *w;
         BOOL isNewWatch = (ip.row == (NSInteger)watches.count);
         if (isNewWatch) {
+            /* size 写成 "0x0" 字符串:新格式一律带 0x 前缀,与旧版裸十进制区分 */
             w = [@{ @"module": self.item[@"module"] ?: @"",
                     @"offset": @"0x0", @"reg": @"x0",
-                    @"action": @"cstr", @"size": @0, @"label": @"" } mutableCopy];
+                    @"action": @"cstr", @"size": @"0x0", @"label": @"" } mutableCopy];
         } else {
             w = watches[ip.row];
         }
@@ -252,9 +553,25 @@
     }
 }
 
-/* watch 行左滑删除 */
+/* 左滑:触发条件那行=清除条件,watch 行=删除 */
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
     trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section == 3) {
+        if ((TrigRowKind)[[self triggerRows][ip.row] integerValue] != TrigRowExpr ||
+            ![self hasTrigger]) {
+            return nil;
+        }
+        __weak typeof(self) weakSelf = self;
+        UIContextualAction *clr = [UIContextualAction
+            contextualActionWithStyle:UIContextualActionStyleDestructive
+                                title:@"清除条件"
+                              handler:^(UIContextualAction *a, UIView *v,
+                                        void (^done)(BOOL)) {
+                  [weakSelf clearTrigger];
+                  done(YES);
+              }];
+        return [UISwipeActionsConfiguration configurationWithActions:@[ clr ]];
+    }
     if (ip.section != 4) return nil;
     NSMutableArray *watches = self.item[@"watches"];
     if (ip.row >= (NSInteger)watches.count) return nil;
@@ -273,8 +590,120 @@
 
 #pragma mark - 完成
 
+/* "0x1234" / "1234" → 数值(与引擎 parse_hex 同规则:一律十六进制) */
+static unsigned long long HexValue(id v) {
+    if ([v isKindOfClass:[NSNumber class]]) return [v unsignedLongLongValue];
+    if (![v isKindOfClass:[NSString class]]) return 0;
+    return strtoull([v UTF8String], NULL, 16);
+}
+
+- (void)alert:(NSString *)title msg:(NSString *)msg {
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:title
+                                            message:msg
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好"
+                                           style:UIAlertActionStyleDefault
+                                         handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
 - (void)done {
     [self.view endEditing:YES]; /* 触发所有 textFieldDidEndEditing 回写 */
+
+    /* 区间太短的话引擎那边会直接拒掉(见 Engine/src/engine.m),这里先挡一道,
+     * 省掉"装上、跑一遍、翻日志"才知道配错了的一轮 */
+    unsigned long long start = HexValue(self.item[@"start"]);
+    unsigned long long end = HexValue(self.item[@"end"]);
+    if (end <= start) {
+        [self alert:@"地址无效" msg:@"结束地址必须大于起始地址。"];
+        return;
+    }
+    if (end - start < TRACE_MIN_RANGE) {
+        [self alert:@"区间太短"
+                msg:[NSString stringWithFormat:
+                                  @"结束地址至少要比起始地址大 0x%x(当前 0x%llx)。\n\n"
+                                  @"Dobby 的 hook 补丁会覆盖起始地址往后 0x%x 字节,"
+                                  @"区间比它短时 trace 停不下来,会一直跑到崩。",
+                                  TRACE_MIN_RANGE, end - start, TRACE_MIN_RANGE]];
+        return;
+    }
+
+    /* 触发条件:表达式语法 + 期望值格式,配错了引擎会拒掉整条 trace,这里先挡 */
+    if ([self hasTrigger]) {
+        NSString *expr = self.item[@"triggerExpr"];
+        if (!ExprSyntaxOK(expr)) {
+            [self alert:@"触发条件无效"
+                    msg:[NSString stringWithFormat:@"取址表达式「%@」语法不对。", expr]];
+            return;
+        }
+        NSString *v = [(self.item[@"triggerValue"] ?: @"")
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        TrigMatchKind k = [self triggerMatch];
+        if (k == TrigMatchBytes) {
+            /* 分隔符与引擎 load_trigger 保持一致:空格/tab/冒号/逗号都忽略 */
+            NSCharacterSet *seps =
+                [NSCharacterSet characterSetWithCharactersInString:@" \t:,"];
+            NSString *hex = [[[v componentsSeparatedByCharactersInSet:seps]
+                componentsJoinedByString:@""] lowercaseString];
+            NSCharacterSet *bad = [[NSCharacterSet
+                characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet];
+            if (hex.length == 0) {
+                [self alert:@"期望值为空" msg:@"选了「字节」就得填要比较的字节,例:08a48c90"];
+                return;
+            }
+            if ([hex rangeOfCharacterFromSet:bad].location != NSNotFound) {
+                [self alert:@"期望值无效" msg:@"「字节」只能填十六进制字符(0-9 a-f),空格随便加。"];
+                return;
+            }
+            if (hex.length % 2 != 0) {
+                [self alert:@"期望值无效"
+                        msg:[NSString stringWithFormat:
+                                          @"「字节」要成对写(当前 %lu 个十六进制字符,少一位)。",
+                                          (unsigned long)hex.length]];
+                return;
+            }
+            if (hex.length / 2 > 32) {
+                [self alert:@"期望值过长" msg:@"最多比较 32 个字节。"];
+                return;
+            }
+        } else if (k == TrigMatchCstr) {
+            if (v.length == 0 || v.length > 32) {
+                [self alert:@"期望值无效" msg:@"「字符串」要填 1–32 个字符。"];
+                return;
+            }
+        } else if (k == TrigMatchU64) {
+            if (v.length == 0) {
+                [self alert:@"期望值为空" msg:@"选了「u64」就得填要比较的数值,例:0x02100481908ca408"];
+                return;
+            }
+        }
+        /* 「包含」时窗口必须装得下要找的东西,否则永远搜不到 */
+        if ((k == TrigMatchBytes || k == TrigMatchCstr) &&
+            [self triggerWhere] == TrigWhereContains) {
+            unsigned long long scan = [self triggerScan];
+            if (scan > TRIG_SCAN_MAX) {
+                [self alert:@"最长读取过大"
+                        msg:[NSString stringWithFormat:@"最多 0x%x 字节。", TRIG_SCAN_MAX]];
+                return;
+            }
+            NSCharacterSet *seps =
+                [NSCharacterSet characterSetWithCharactersInString:@" \t:,"];
+            unsigned long long need =
+                (k == TrigMatchBytes)
+                    ? [[v componentsSeparatedByCharactersInSet:seps]
+                          componentsJoinedByString:@""].length / 2
+                    : [v lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+            if (scan < need) {
+                [self alert:@"最长读取太小"
+                        msg:[NSString stringWithFormat:
+                                          @"要找的东西有 0x%llx 字节,但只读 0x%llx 字节 —— "
+                                          @"永远搜不到。把「最长读取」调大。",
+                                          need, scan]];
+                return;
+            }
+        }
+    }
 
     ConfigStore *store = [ConfigStore shared];
     if (self.isNew) {
