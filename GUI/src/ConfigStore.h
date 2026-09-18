@@ -4,9 +4,10 @@
  * 顶层: { enabled: bool, items: [ item... ] }
  * item:  { id, enabled, traceName(可选), bundleId, appName, module, start, end, count,
  *          moduleOnly, delaySecs, logMask, maxInstructions(可选,0=不限制),
- *          triggerExpr, triggerAddress, triggerMatch, triggerValue,
- *          triggerWhere, triggerScan,                 // 触发条件(可选)
+ *          triggerConsume: repeat|once, triggers: [ trigger... ],
  *          watches: [ watch... ] }
+ * trigger: { triggerExpr, triggerAddress, triggerMatch, triggerValue,
+ *            triggerWhere, triggerScan }
  * watch: { module, offset, reg, expr, action, size, label } */
 @interface ConfigStore : NSObject
 

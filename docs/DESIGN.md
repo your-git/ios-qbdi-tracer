@@ -128,7 +128,7 @@ origin trampoline —— QBDI 执行的是那份副本,副本地址永远不等�
 同一个 hook 点常常被调用很多次,只有少数几次携带你要的数据(其余可能是 `0x0`)。
 `count` 是"前 N 次",挡不住这种情况 —— 第一次的垃圾数据就把次数消耗掉了。
 
-所以 trace 条目可以带一个**触发条件**:
+所以 trace 条目可以带任意多条**触发条件**；多条之间是 OR，任意一条满足即可:
 
 `triggerAddress` 缺失/留空/等于 `static_start` 时沿用原流程:
 
@@ -145,9 +145,13 @@ trigger hook 命中并匹配 → 授权同一线程的下一次 start
 start hook 命中且有授权 → 消费授权 → run_trace
 ```
 
-授权用 TLS bitmask 隔离,防止 A 线程命中条件却让 B 线程开始 Trace。高于结束地址的
+授权用按条件数量懒分配的 TLS 状态隔离,防止 A 线程命中条件却让 B 线程开始 Trace。高于结束地址的
 触发点因此可以授权程序之后跳回低地址的下一轮 Trace。所有判断都在
-`g_remaining[idx]` 递减之前,不匹配不浪费 Trace 次数。
+`g_remaining[idx]` 递减之前,不匹配不浪费 Trace 次数；Trace 未成功到达 end 时也会归还次数。
+相同判断地址的条件共享一个 Dobby Hook，不同地址必须至少相差 `0x10`。
+
+`triggerConsume=once` 时，每条条件只在成功 Trace 后消耗一次，并用原子状态避免两个线程
+同时消费；失败会释放占用。`repeat` 为兼容旧配置的默认策略。
 
 四种匹配方式(`TrigMatch`)× 两种位置(`TrigWhere`),都在 `config.h`:
 
@@ -252,19 +256,19 @@ after N filtered calls`。
       "module": "MainModule",      // dyld 镜像名子串
       "start": "0x27A1F4E0",          // 相对模块基址偏移(hex 字符串)
       "end": "0x27A1F4F0",            // 同上,执行到此即停(不含)
-      "count": 1,                     // trace 次数,之后透传
+      "count": 1,                     // 成功 trace 次数,范围 1..16
       "moduleOnly": true,             // 1=只记录模块内指令
       "delaySecs": 10,                // 本条目延迟多少秒装 hook
       "logMask": 17,                  // LOG_INST=1 MEM=2 REGS=4 BRANCH=8 VREG=16 位或
                                       // 界面已不再暴露这一栏,新建/编辑后统一写 17
                                       // (INST|VREG);引擎照旧按字段值跑,旧配置不受影响
       "maxInstructions": 0,           // 可选;0/缺省=跑到 end,非 0=达上限时截断
-      "triggerExpr": "[x2+0x10]",     // 触发条件:留空/缺失 = 无条件(默认)
-      "triggerAddress": "0x27A1F400", // 可选;缺失/留空=start,否则必须在 trace 区间外
-      "triggerMatch": "bytes",        // notnull | bytes | cstr | u64
-      "triggerValue": "08a48c90",     // bytes 按内存顺序;u64 是小端整数;notnull 不用填
-      "triggerWhere": "prefix",       // prefix | contains(缺省:cstr=contains,bytes=prefix)
-      "triggerScan": "0x100",         // contains 的读取上限,默认 0x100、最大 0x1000
+      "triggerConsume": "repeat",     // repeat | once
+      "triggers": [                    // 空数组=无条件;数量不设 UI/配置上限
+        { "triggerExpr": "[x2+0x10]", "triggerAddress": "0x27A1F400",
+          "triggerMatch": "bytes", "triggerValue": "08a48c90",
+          "triggerWhere": "prefix", "triggerScan": "0x100" }
+      ],
       "watches": [
         { "module": "ModuleName", "offset": "0x27A1F4E8",
           "reg": "x0", "action": "cstr", "size": "0x0", "label": "url" },

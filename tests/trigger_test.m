@@ -7,6 +7,17 @@
 /* 引擎里那几个函数(构建时由脚本从 engine.m 原样提取) */
 #include "engine_trigger.inc"
 
+static bool test_load_trigger(NSDictionary *it, TraceTrigger *trigger,
+                              char *err, size_t errcap) {
+    TraceSpec owner;
+    memset(&owner, 0, sizeof(owner));
+    owner.static_start = 0x1000;
+    owner.static_end = 0x2000;
+    return load_trigger(it, &owner, trigger, err, errcap);
+}
+#define load_trigger(it, trigger, err, errcap) \
+    test_load_trigger((it), (trigger), (err), (errcap))
+
 /* 纯比较逻辑,从 qbdi_trace.c 原样提取 */
 #include "trig_compare.inc"
 
@@ -14,7 +25,7 @@ static int g_fail = 0;
 
 /* 期望解析成功,且字节内容与 want 一致 */
 static void ok_bytes(NSString *value, const char *want, int wantN) {
-    TraceSpec t;
+    TraceTrigger t;
     memset(&t, 0, sizeof(t));
     char err[96] = "";
     NSDictionary *it = @{ @"triggerExpr": @"[x2+0x10]",
@@ -25,8 +36,8 @@ static void ok_bytes(NSString *value, const char *want, int wantN) {
         g_fail++;
         return;
     }
-    if (t.trigger_match != TRIG_BYTES) {
-        printf("FAIL \"%s\" match 类型错:%d\n", [value UTF8String], t.trigger_match);
+    if (t.match != TRIG_BYTES) {
+        printf("FAIL \"%s\" match 类型错:%d\n", [value UTF8String], t.match);
         g_fail++;
         return;
     }
@@ -45,7 +56,7 @@ static void ok_bytes(NSString *value, const char *want, int wantN) {
 }
 
 static void reject(NSString *match, NSString *value) {
-    TraceSpec t;
+    TraceTrigger t;
     memset(&t, 0, sizeof(t));
     char err[96] = "";
     NSDictionary *it = @{ @"triggerExpr": @"[x2+0x10]",
@@ -62,7 +73,7 @@ static void reject(NSString *match, NSString *value) {
 
 
 /* 解析出一条 spec(失败则 g_fail++ 并返回 false) */
-static bool build(NSDictionary *it, TraceSpec *t, const char *what) {
+static bool build(NSDictionary *it, TraceTrigger *t, const char *what) {
     memset(t, 0, sizeof(*t));
     char err[96] = "";
     if (!load_trigger(it, t, err, sizeof(err))) {
@@ -75,15 +86,15 @@ static bool build(NSDictionary *it, TraceSpec *t, const char *what) {
 
 static void check_where(NSString *match, NSString *where, TrigWhere want,
                         const char *what) {
-    TraceSpec t;
+    TraceTrigger t;
     NSMutableDictionary *it = [@{ @"triggerExpr": @"[x2+0x10]",
                                  @"triggerMatch": match,
                                  @"triggerValue": @"0a0b" } mutableCopy];
     if (where != nil) it[@"triggerWhere"] = where;
     if (![match isEqualToString:@"bytes"]) it[@"triggerValue"] = @"ab";
     if (!build(it, &t, what)) return;
-    if (t.trigger_where != want) {
-        printf("FAIL %s: where = %d, 期望 %d\n", what, t.trigger_where, want);
+    if (t.where != want) {
+        printf("FAIL %s: where = %d, 期望 %d\n", what, t.where, want);
         g_fail++;
         return;
     }
@@ -94,7 +105,7 @@ static void check_where(NSString *match, NSString *where, TrigWhere want,
 /* 纯比较逻辑(从 qbdi_trace.c 提取),data 是"已经读到的数据" */
 static void check_cmp(TrigMatch m, TrigWhere w, NSString *value,
                       const char *data, size_t n, bool want) {
-    TraceSpec t;
+    TraceTrigger t;
     NSDictionary *it = @{ @"triggerExpr": @"[x0]",
                           @"triggerMatch": (m == TRIG_BYTES ? @"bytes" : @"cstr"),
                           @"triggerWhere": (w == TRIG_AT_CONTAINS ? @"contains"
@@ -119,17 +130,15 @@ static void check_cmp(TrigMatch m, TrigWhere w, NSString *value,
 
 static void check_trigger_address(NSString *address, bool want,
                                   uint64_t expected, const char *what) {
-    TraceSpec t;
+    TraceTrigger t;
     memset(&t, 0, sizeof(t));
-    t.static_start = 0x1000;
-    t.static_end = 0x2000;
     char err[160] = "";
     NSMutableDictionary *it = [@{ @"triggerExpr": @"[x0]" } mutableCopy];
     if (address != nil) it[@"triggerAddress"] = address;
     bool got = load_trigger(it, &t, err, sizeof(err));
-    if (got != want || (got && t.trigger_address != expected)) {
+    if (got != want || (got && t.address != expected)) {
         printf("FAIL %s: got=%d address=0x%llx err=%s\n", what, got,
-               (unsigned long long)t.trigger_address, err);
+               (unsigned long long)t.address, err);
         g_fail++;
         return;
     }
@@ -158,12 +167,12 @@ int main(void) {
 
         puts("\n-- 其它匹配方式 --");
         {
-            TraceSpec t; memset(&t, 0, sizeof(t)); char err[96] = "";
+            TraceTrigger t; memset(&t, 0, sizeof(t)); char err[96] = "";
             NSDictionary *it = @{ @"triggerExpr": @"[x2+0x10]",
                                   @"triggerMatch": @"u64",
                                   @"triggerValue": @"0x02100481908ca408" };
             if (load_trigger(it, &t, err, sizeof(err)) &&
-                t.trigger_match == TRIG_U64 &&
+                t.match == TRIG_U64 &&
                 t.want_u64 == 0x02100481908ca408ULL) {
                 printf("ok   u64 0x%llx\n", (unsigned long long)t.want_u64);
             } else {
@@ -173,12 +182,12 @@ int main(void) {
             }
         }
         {
-            TraceSpec t; memset(&t, 0, sizeof(t)); char err[96] = "";
+            TraceTrigger t; memset(&t, 0, sizeof(t)); char err[96] = "";
             NSDictionary *it = @{ @"triggerExpr": @"[x0]",
                                   @"triggerMatch": @"cstr",
                                   @"triggerValue": @"https://" };
             if (load_trigger(it, &t, err, sizeof(err)) &&
-                t.trigger_match == TRIG_CSTR && t.want_nbytes == 8 &&
+                t.match == TRIG_CSTR && t.want_nbytes == 8 &&
                 memcmp(t.want_bytes, "https://", 8) == 0) {
                 puts("ok   cstr \"https://\"");
             } else {
@@ -188,9 +197,9 @@ int main(void) {
         }
         {
             /* 没配表达式 = 无条件,不能报错 */
-            TraceSpec t; memset(&t, 0, sizeof(t)); char err[96] = "";
+            TraceTrigger t; memset(&t, 0, sizeof(t)); char err[96] = "";
             if (load_trigger(@{}, &t, err, sizeof(err)) &&
-                t.trigger_match == TRIG_NONE && t.trigger_expr == NULL) {
+                t.match == TRIG_NONE && t.expr == NULL) {
                 puts("ok   没配 triggerExpr → 无条件");
             } else {
                 printf("FAIL 空配置应当是无条件:%s\n", err);
@@ -199,9 +208,9 @@ int main(void) {
         }
         {
             /* 只配表达式、不配 match → 默认 notnull */
-            TraceSpec t; memset(&t, 0, sizeof(t)); char err[96] = "";
+            TraceTrigger t; memset(&t, 0, sizeof(t)); char err[96] = "";
             if (load_trigger(@{ @"triggerExpr": @"[x2+0x10]" }, &t, err, sizeof(err)) &&
-                t.trigger_match == TRIG_NOTNULL) {
+                t.match == TRIG_NOTNULL) {
                 puts("ok   只配表达式 → 默认 notnull");
             } else {
                 printf("FAIL 默认 match 应当是 notnull:%s\n", err);
@@ -220,7 +229,7 @@ int main(void) {
         check_trigger_address(@"0x2400", true, 0x2400, "高于 end");
         check_trigger_address(@"0x12zz", false, 0, "含非法字符");
         {
-            TraceSpec t; char err[96] = "";
+            TraceTrigger t; char err[96] = "";
             memset(&t, 0, sizeof(t));
             NSDictionary *it = @{ @"triggerExpr": @"[x0]", @"triggerMatch": @"bytes",
                                   @"triggerWhere": @"somewhere",
@@ -235,7 +244,7 @@ int main(void) {
 
         puts("\n-- 表达式语法错要连带拒掉整条 --");
         {
-            TraceSpec t; memset(&t, 0, sizeof(t)); char err[96] = "";
+            TraceTrigger t; memset(&t, 0, sizeof(t)); char err[96] = "";
             NSDictionary *it = @{ @"triggerExpr": @"[[x2+8" };
             if (!load_trigger(it, &t, err, sizeof(err))) {
                 printf("ok   拒绝坏表达式:%s\n", err);
@@ -253,7 +262,7 @@ int main(void) {
 
         puts("\n-- 窗口不能比要找的东西还短 --");
         {
-            TraceSpec t; char err[96] = "";
+            TraceTrigger t; char err[96] = "";
             NSDictionary *it = @{ @"triggerExpr": @"[x0]", @"triggerMatch": @"bytes",
                                   @"triggerWhere": @"contains",
                                   @"triggerValue": @"0102030405060708",  /* 8 字节 */
@@ -267,7 +276,7 @@ int main(void) {
             }
         }
         {
-            TraceSpec t; char err[96] = "";
+            TraceTrigger t; char err[96] = "";
             NSDictionary *it = @{ @"triggerExpr": @"[x0]", @"triggerMatch": @"bytes",
                                   @"triggerWhere": @"contains",
                                   @"triggerValue": @"0102",
@@ -282,14 +291,14 @@ int main(void) {
         }
         {
             /* scan 缺省 = TRIG_DEF_SCAN */
-            TraceSpec t;
+            TraceTrigger t;
             if (build(@{ @"triggerExpr": @"[x0]", @"triggerMatch": @"cstr",
                          @"triggerValue": @"api" }, &t, "cstr 默认 scan") &&
-                t.trigger_scan == TRIG_DEF_SCAN) {
-                printf("ok   scan 缺省 = 0x%x\n", t.trigger_scan);
+                t.scan == TRIG_DEF_SCAN) {
+                printf("ok   scan 缺省 = 0x%x\n", t.scan);
             } else {
                 printf("FAIL scan 缺省应当是 0x%x,得到 0x%x\n", TRIG_DEF_SCAN,
-                       t.trigger_scan);
+                       t.scan);
                 g_fail++;
             }
         }

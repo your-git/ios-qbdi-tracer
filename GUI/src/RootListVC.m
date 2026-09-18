@@ -24,8 +24,8 @@ static BOOL traceEnabled(NSDictionary *item) {
 - (void)reloadItem:(NSMutableDictionary *)item;
 - (void)renameItem:(NSMutableDictionary *)item
               done:(void (^)(BOOL))done;
-- (void)showNotices;
 - (void)showTriggerNotice;
+- (void)showTriggerPolicy;
 @end
 
 @implementation RootListVC
@@ -63,10 +63,15 @@ static BOOL traceEnabled(NSDictionary *item) {
         [UIAlertController alertControllerWithTitle:@"帮助"
                                             message:nil
                                      preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"注意事项"
+    [ac addAction:[UIAlertAction actionWithTitle:@"触发条件注意事项"
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) {
-              [self showNotices];
+              [self showTriggerNotice];
+          }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"触发消耗策略"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+              [self showTriggerPolicy];
           }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"查看 Trace 日志输出位置"
                                            style:UIAlertActionStyleDefault
@@ -426,32 +431,20 @@ static BOOL traceEnabled(NSDictionary *item) {
     [self presentViewController:ac animated:YES completion:nil];
 }
 
-- (void)showNotices {
-    UIAlertController *ac =
-        [UIAlertController alertControllerWithTitle:@"注意事项"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"触发条件"
-                                           style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *a) {
-              [self showTriggerNotice];
-          }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"关闭"
-                                           style:UIAlertActionStyleCancel
-                                         handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-
 - (void)showTriggerNotice {
     NSString *message =
-        @"1. 判断地址留空时，使用 Trace 起始地址，并在起始 Hook 处判断。\n\n"
-        @"2. 自定义判断地址可以低于起始地址，也可以等于或高于结束地址；"
+        @"1. 可以添加任意数量的触发条件。没有条件时为无条件 Trace；有多条时，"
+        @"满足其中任意一条即可。Trace 次数必须是 1–16。\n\n"
+        @"2. 第一条条件的判断地址默认使用 Trace 起始地址。继续添加时，会自动带入"
+        @"第一条的判断地址和取址表达式，仍可自行修改。\n\n"
+        @"3. 自定义判断地址可以低于起始地址，也可以等于或高于结束地址；"
         @"不能位于起始地址和结束地址之间。\n\n"
-        @"3. 自定义判断地址命中后，只会授权同一线程下一次到达起始地址时 Trace。"
+        @"4. 自定义判断地址命中后，只会授权同一线程下一次到达起始地址时 Trace。"
         @"因此高地址可用于程序之后跳回低地址的流程。\n\n"
-        @"4. ARM64 下 Dobby Hook 补丁占 0x10 字节。判断地址低于起始地址时，"
-        @"两者必须至少间隔 0x10，否则补丁会重叠。\n\n"
-        @"5. 自定义判断地址也会安装 Dobby Hook。请尽量选择不会在 Trace 动态调用路径中"
+        @"5. ARM64 下 Dobby Hook 补丁占 0x10 字节。不同的触发地址之间，以及触发地址"
+        @"与起始地址之间，都必须至少相差 0x10。完全相同的触发地址会共享一个 Hook，"
+        @"不需要留间隔。\n\n"
+        @"6. 自定义判断地址也会安装 Dobby Hook。请尽量选择不会在 Trace 动态调用路径中"
         @"再次执行的控制流位置，避免 Dobby 补丁影响 QBDI 对该路径的执行。";
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"触发条件注意事项"
@@ -460,6 +453,21 @@ static BOOL traceEnabled(NSDictionary *item) {
     [ac addAction:[UIAlertAction actionWithTitle:@"关闭"
                                            style:UIAlertActionStyleCancel
                                          handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)showTriggerPolicy {
+    NSString *message =
+        @"仅一次：每一条触发条件在当前目标 App 进程中，最多促成一次成功 Trace。"
+        @"只有 QBDI 确实运行到配置的结束地址后才算消耗；如果监控失败、提前停止或没有"
+        @"到达结束地址，该条件不会被消耗，可以继续重试。若一次 Trace 同时由多条条件"
+        @"满足，这些条件会一起被消耗。重启目标 App 后状态重置。\n\n"
+        @"可重复：条件不会被消耗。每次满足任意一条条件，都可以继续触发 Trace，直到"
+        @"达到设置的 Trace 次数。自定义地址的匹配只授权同一线程下一次到达起始地址。";
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"触发策略" message:message
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:ac animated:YES completion:nil];
 }
 
@@ -501,6 +509,11 @@ static BOOL traceEnabled(NSDictionary *item) {
         [mw addObject:[w mutableCopy]];
     }
     copy[@"watches"] = mw;
+    NSMutableArray *mt = [NSMutableArray array];
+    for (NSDictionary *tr in src[@"triggers"]) {
+        [mt addObject:[tr mutableCopy]];
+    }
+    copy[@"triggers"] = mt;
     [[self store].items insertObject:copy atIndex:indexPath.row + 1];
     [self persist];
     [self.tableView reloadData];

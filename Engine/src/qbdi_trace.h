@@ -16,6 +16,9 @@ enum {
 
 #define TRACE_MAX_TARGETS 32
 #define TRACE_MAX_WATCHES 128
+/* 条件数量不设上限；只有“不同的外部触发地址”需要独立机器码 trampoline。
+ * 相同地址的任意多条条件共用一个槽位。 */
+#define TRACE_MAX_TRIGGER_HOOKS 128
 /* Dobby 在 arm64 上的补丁长度:补丁覆盖 [start, start+16),原代码从 start+16 继续 */
 #define QBDI_PATCH_SIZE 16
 
@@ -30,7 +33,9 @@ typedef struct {
 /* 自动 hook 每目标的运行时状态(次数用完透传) */
 extern void *g_origin[TRACE_MAX_TARGETS];
 /* 自定义触发地址的 Dobby origin；触发地址=起始地址时为 NULL。 */
-extern void *g_trigger_origin[TRACE_MAX_TARGETS];
+extern void *g_trigger_origin[TRACE_MAX_TRIGGER_HOOKS];
+extern int g_trigger_trace_slot[TRACE_MAX_TRIGGER_HOOKS];
+extern uint64_t g_trigger_address[TRACE_MAX_TRIGGER_HOOKS];
 extern int g_remaining[TRACE_MAX_TARGETS];
 /* 装 hook 时算好的模块运行时基址。**别在命中时重新 find_module** ——
  * 那会遍历所有 dyld 镜像做 strstr 并抢 dyld 锁,热点上足以把整个进程拖死。 */
@@ -44,7 +49,7 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx);
 
 /* 自定义触发 hook 入口：只判断条件并授权同线程下一次 trace，
  * 不在这个 hook 上直接启动 QBDI。返回值是该 hook 的 Dobby origin。 */
-uint64_t trigger_ctx_entry(TraceRegFile *rf, int idx);
+uint64_t trigger_ctx_entry(TraceRegFile *rf, int hook_idx);
 
 /* 手动区间 trace:从 模块基址+static_start 跑到 模块基址+static_end,返回停止时 x0。
  * 手动调用前可设 g_enter_args[8] 作参数;g_enter_origin 为 NULL 时从真实模块地址起跑。 */

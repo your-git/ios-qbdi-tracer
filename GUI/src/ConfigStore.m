@@ -58,6 +58,43 @@
                     }
                 }
                 m[@"watches"] = mw;
+                /* triggers 深拷；旧版扁平触发字段迁移成一条，未配置则保持空数组。 */
+                NSMutableArray *mt = [NSMutableArray array];
+                NSArray *triggers = it[@"triggers"];
+                if ([triggers isKindOfClass:[NSArray class]]) {
+                    for (NSDictionary *e in triggers) {
+                        if ([e isKindOfClass:[NSDictionary class]]) {
+                            NSMutableDictionary *copy = [e mutableCopy];
+                            id address = copy[@"triggerAddress"];
+                            if ([address isKindOfClass:[NSNumber class]]) {
+                                copy[@"triggerAddress"] = [NSString stringWithFormat:
+                                    @"0x%llx", [address unsignedLongLongValue]];
+                            }
+                            [mt addObject:copy];
+                        }
+                    }
+                } else if ([it[@"triggerExpr"] isKindOfClass:[NSString class]] &&
+                           [it[@"triggerExpr"] length] > 0) {
+                    NSMutableDictionary *legacy = [NSMutableDictionary dictionary];
+                    for (NSString *key in @[ @"triggerExpr", @"triggerAddress",
+                                             @"triggerMatch", @"triggerValue",
+                                             @"triggerWhere", @"triggerScan" ]) {
+                        if (it[key] != nil) legacy[key] = it[key];
+                    }
+                    id address = legacy[@"triggerAddress"];
+                    if ([address isKindOfClass:[NSNumber class]]) {
+                        legacy[@"triggerAddress"] = [NSString stringWithFormat:
+                            @"0x%llx", [address unsignedLongLongValue]];
+                    }
+                    [mt addObject:legacy];
+                }
+                m[@"triggers"] = mt;
+                if (m[@"triggerConsume"] == nil) m[@"triggerConsume"] = @"repeat";
+                for (NSString *key in @[ @"triggerExpr", @"triggerAddress",
+                                         @"triggerMatch", @"triggerValue",
+                                         @"triggerWhere", @"triggerScan" ]) {
+                    [m removeObjectForKey:key];
+                }
                 [self.items addObject:m];
             }
         }
@@ -101,7 +138,8 @@
         @"delaySecs": @0,
         @"logMask": @17,         /* LOG_INST | LOG_VREG(界面已不再让用户选) */
         @"maxInstructions": @0,  /* 0=精确跑到 end，不按指令数截断 */
-        @"triggerAddress": @"", /* 留空=起始地址；旧 JSON 缺失时同样处理 */
+        @"triggerConsume": @"repeat",
+        @"triggers": [NSMutableArray array],
         @"watches": [NSMutableArray array],
     } mutableCopy];
 }
@@ -231,6 +269,7 @@ static NSString *sanitizeName(NSString *s) {
     for (NSString *k in @[ @"enabled", @"traceName", @"bundleId", @"appName", @"module",
                            @"start", @"end", @"count", @"moduleOnly",
                            @"delaySecs", @"logMask", @"maxInstructions",
+                           @"triggerConsume",
                            @"triggerExpr", @"triggerAddress",
                            @"triggerMatch", @"triggerValue",
                            @"triggerWhere", @"triggerScan" ]) {
@@ -246,6 +285,40 @@ static NSString *sanitizeName(NSString *s) {
         }
     }
     out[@"watches"] = mw;
+    NSMutableArray *mt = [NSMutableArray array];
+    if ([item[@"triggers"] isKindOfClass:[NSArray class]]) {
+        for (NSDictionary *tr in item[@"triggers"]) {
+            if ([tr isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *copy = [tr mutableCopy];
+                id address = copy[@"triggerAddress"];
+                if ([address isKindOfClass:[NSNumber class]]) {
+                    copy[@"triggerAddress"] = [NSString stringWithFormat:
+                        @"0x%llx", [address unsignedLongLongValue]];
+                }
+                [mt addObject:copy];
+            }
+        }
+    } else if ([item[@"triggerExpr"] isKindOfClass:[NSString class]] &&
+               [item[@"triggerExpr"] length] > 0) {
+        NSMutableDictionary *legacy = [NSMutableDictionary dictionary];
+        for (NSString *key in @[ @"triggerExpr", @"triggerAddress",
+                                 @"triggerMatch", @"triggerValue",
+                                 @"triggerWhere", @"triggerScan" ]) {
+            if (item[key] != nil) legacy[key] = item[key];
+        }
+        id address = legacy[@"triggerAddress"];
+        if ([address isKindOfClass:[NSNumber class]]) {
+            legacy[@"triggerAddress"] = [NSString stringWithFormat:
+                @"0x%llx", [address unsignedLongLongValue]];
+        }
+        [mt addObject:legacy];
+    }
+    out[@"triggers"] = mt;
+    for (NSString *key in @[ @"triggerExpr", @"triggerAddress",
+                             @"triggerMatch", @"triggerValue",
+                             @"triggerWhere", @"triggerScan" ]) {
+        [out removeObjectForKey:key];
+    }
     /* 重生 id、默认启用,避免与现有条目冲突 */
     out[@"id"] = [[NSUUID UUID] UUIDString];
     out[@"enabled"] = @YES;

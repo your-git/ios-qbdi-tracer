@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <dispatch/dispatch.h>
 #import <mach-o/dyld.h>
+#import <stdlib.h>
 #import <string.h>
 
 #import <dobby.h>
@@ -16,8 +17,9 @@ int        g_watch_count = 0;
 
 /* 已成功安装的 Dobby 补丁绝对地址。配置中的模块名是子串，两个不同字符串
  * 也可能匹配到同一镜像，所以装 Hook 前还要用绝对地址再挡一道。 */
-static uint64_t g_installed_hook_targets[TRACE_MAX_TARGETS * 2];
+static uint64_t g_installed_hook_targets[TRACE_MAX_TARGETS + TRACE_MAX_TRIGGER_HOOKS];
 static int g_installed_hook_count;
+static int g_trigger_hook_count;
 
 /* 控制 App 自己的 bundleId:引擎注入到它时要跳过(不自钩) */
 #define GUI_BUNDLE_ID @"com.snk.qbditracer"
@@ -136,54 +138,60 @@ static const char *dup_str(id v) {
     return s ? strdup(s) : NULL;
 }
 
+static bool hook_patches_overlap(uint64_t a, uint64_t b);
+
 /* 解析触发条件。返回 false = 配置有问题(调用方应拒绝整条 trace,而不是退化成无条件 ——
  * 过滤静默失效会给一堆本该被滤掉的日志,比不 trace 更误导)。err 写人可读原因。 */
-static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errcap) {
-    t->trigger_match = TRIG_NONE;
-    t->trigger_where = TRIG_AT_PREFIX;
-    t->trigger_scan  = TRIG_DEF_SCAN;
-    t->trigger_expr  = NULL;
+static bool load_trigger(NSDictionary *it, const TraceSpec *owner,
+                         TraceTrigger *t, char *err, size_t errcap) {
+    t->match = TRIG_NONE;
+    t->where = TRIG_AT_PREFIX;
+    t->scan  = TRIG_DEF_SCAN;
+    t->expr  = NULL;
     t->want_nbytes   = 0;
     t->want_u64      = 0;
-    t->trigger_address = t->static_start;
-    memset(&t->trigger_cexpr, 0, sizeof(t->trigger_cexpr));
+    t->address = owner->static_start;
+    t->next_log = 1;
+    memset(&t->cexpr, 0, sizeof(t->cexpr));
 
     const char *expr = dup_str(it[@"triggerExpr"]);
     if (expr == NULL) {
         return true; /* 没配条件:无条件 trace,和以前一样 */
     }
 
-    if (!wexpr_compile(expr, &t->trigger_cexpr, err, errcap)) {
+    if (!wexpr_compile(expr, &t->cexpr, err, errcap)) {
         return false;
     }
-    t->trigger_expr = expr;
+    t->expr = expr;
 
     id address = it[@"triggerAddress"];
     if ([address isKindOfClass:[NSString class]] && [address length] == 0) {
         address = nil; /* App 里留空 = 起始地址 */
     }
-    if (address != nil && !parse_hex_strict(address, &t->trigger_address)) {
+    if (address != nil && !parse_hex_strict(address, &t->address)) {
         snprintf(err, errcap, "triggerAddress is not a valid hex address");
         return false;
     }
     /* 等于 start 沿用原 hook；其余地址必须在数值区间外。
      * 低于 start 时还要避免两个 0x10 字节的 Dobby 补丁重叠。 */
-    if (t->trigger_address > t->static_start &&
-        t->trigger_address < t->static_end) {
+    if (t->address > owner->static_start &&
+        t->address < owner->static_end) {
         snprintf(err, errcap,
                  "triggerAddress 0x%llx is inside trace range (0x%llx, 0x%llx)",
-                 (unsigned long long)t->trigger_address,
-                 (unsigned long long)t->static_start,
-                 (unsigned long long)t->static_end);
+                 (unsigned long long)t->address,
+                 (unsigned long long)owner->static_start,
+                 (unsigned long long)owner->static_end);
         return false;
     }
-    if (t->trigger_address < t->static_start &&
-        t->static_start - t->trigger_address < QBDI_PATCH_SIZE) {
+    uint64_t start_distance = t->address > owner->static_start
+                                  ? t->address - owner->static_start
+                                  : owner->static_start - t->address;
+    if (t->address != owner->static_start && start_distance < QBDI_PATCH_SIZE) {
         snprintf(err, errcap,
                  "triggerAddress 0x%llx is too close to start 0x%llx; "
                  "Dobby hooks need at least 0x%x bytes",
-                 (unsigned long long)t->trigger_address,
-                 (unsigned long long)t->static_start, QBDI_PATCH_SIZE);
+                 (unsigned long long)t->address,
+                 (unsigned long long)owner->static_start, QBDI_PATCH_SIZE);
         return false;
     }
 
@@ -196,15 +204,15 @@ static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errca
     NSString *w = it[@"triggerWhere"];
     if ([w isKindOfClass:[NSString class]] && [w length] > 0) {
         if ([w isEqualToString:@"contains"]) {
-            t->trigger_where = TRIG_AT_CONTAINS;
+            t->where = TRIG_AT_CONTAINS;
         } else if ([w isEqualToString:@"prefix"]) {
-            t->trigger_where = TRIG_AT_PREFIX;
+            t->where = TRIG_AT_PREFIX;
         } else {
             snprintf(err, errcap, "unknown triggerWhere \"%s\"", [w UTF8String]);
             return false;
         }
     } else {
-        t->trigger_where =
+        t->where =
             [m isEqualToString:@"cstr"] ? TRIG_AT_CONTAINS : TRIG_AT_PREFIX;
     }
 
@@ -219,16 +227,19 @@ static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errca
                      (unsigned long long)sc, TRIG_MAX_SCAN);
             return false;
         }
-        t->trigger_scan = (uint32_t)sc;
+        t->scan = (uint32_t)sc;
     }
 
     if ([m isEqualToString:@"notnull"]) {
-        t->trigger_match = TRIG_NOTNULL;
+        t->match = TRIG_NOTNULL;
         return true;
     }
     if ([m isEqualToString:@"u64"]) {
-        t->trigger_match = TRIG_U64;
-        t->want_u64 = parse_hex(v); /* 一律十六进制,与 offset 同规则 */
+        t->match = TRIG_U64;
+        if (!parse_hex_strict(v, &t->want_u64)) {
+            snprintf(err, errcap, "u64 value is not valid hexadecimal");
+            return false;
+        }
         return true;
     }
     if ([m isEqualToString:@"cstr"]) {
@@ -240,11 +251,11 @@ static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errca
         }
         memcpy(t->want_bytes, s, n);
         t->want_nbytes = (int)n;
-        t->trigger_match = TRIG_CSTR;
-        if (t->trigger_where == TRIG_AT_CONTAINS && t->trigger_scan < n) {
+        t->match = TRIG_CSTR;
+        if (t->where == TRIG_AT_CONTAINS && t->scan < n) {
             snprintf(err, errcap,
                      "triggerScan 0x%x is smaller than the %zu-byte needle",
-                     t->trigger_scan, n);
+                     t->scan, n);
             return false;
         }
         return true;
@@ -292,12 +303,12 @@ static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errca
             return false;
         }
         t->want_nbytes = n;
-        t->trigger_match = TRIG_BYTES;
+        t->match = TRIG_BYTES;
         /* 窗口比要找的东西还短,那永远搜不到 —— 拦下来,别让它静默不匹配 */
-        if (t->trigger_where == TRIG_AT_CONTAINS && (int)t->trigger_scan < n) {
+        if (t->where == TRIG_AT_CONTAINS && (int)t->scan < n) {
             snprintf(err, errcap,
                      "triggerScan 0x%x is smaller than the %d-byte needle",
-                     t->trigger_scan, n);
+                     t->scan, n);
             return false;
         }
         return true;
@@ -305,6 +316,53 @@ static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errca
 
     snprintf(err, errcap, "unknown triggerMatch \"%s\"", [m UTF8String]);
     return false;
+}
+
+static bool load_triggers(NSDictionary *item, TraceSpec *spec,
+                          char *err, size_t errcap) {
+    NSArray *arr = [item[@"triggers"] isKindOfClass:[NSArray class]]
+                       ? item[@"triggers"] : nil;
+    /* 旧 JSON 的扁平字段自动迁移成一条条件。 */
+    bool legacy = arr == nil &&
+                  [item[@"triggerExpr"] isKindOfClass:[NSString class]] &&
+                  [item[@"triggerExpr"] length] > 0;
+    NSUInteger count = arr != nil ? arr.count : (legacy ? 1u : 0u);
+    spec->trigger_once = [item[@"triggerConsume"] isEqual:@"once"] ? 1 : 0;
+    if (count == 0) return true;
+
+    spec->triggers = calloc(count, sizeof(TraceTrigger));
+    if (spec->triggers == NULL) {
+        snprintf(err, errcap, "out of memory for %lu triggers", (unsigned long)count);
+        return false;
+    }
+    for (NSUInteger i = 0; i < count; i++) {
+        NSDictionary *src = legacy ? item : arr[i];
+        if (![src isKindOfClass:[NSDictionary class]]) {
+            snprintf(err, errcap, "trigger %lu is not an object", (unsigned long)i + 1);
+            return false;
+        }
+        if (!load_trigger(src, spec, &spec->triggers[i], err, errcap)) {
+            return false;
+        }
+        if (spec->triggers[i].match == TRIG_NONE) {
+            snprintf(err, errcap, "trigger %lu has no expression", (unsigned long)i + 1);
+            return false;
+        }
+        for (NSUInteger j = 0; j < i; j++) {
+            uint64_t a = spec->triggers[i].address;
+            uint64_t b = spec->triggers[j].address;
+            if (a != b && hook_patches_overlap(a, b)) {
+                snprintf(err, errcap,
+                         "trigger %lu address 0x%llx is within 0x%x bytes of trigger %lu at 0x%llx",
+                         (unsigned long)i + 1, (unsigned long long)a,
+                         QBDI_PATCH_SIZE, (unsigned long)j + 1,
+                         (unsigned long long)b);
+                return false;
+            }
+        }
+    }
+    spec->trigger_count = (int)count;
+    return true;
 }
 
 static bool hook_patches_overlap(uint64_t a, uint64_t b) {
@@ -336,23 +394,27 @@ static void remember_installed_hook(uint64_t target) {
 static bool find_hook_conflict(const TraceSpec *t, int *other_slot,
                                uint64_t *this_address,
                                uint64_t *other_address) {
-    uint64_t mine[2] = { t->static_start, t->trigger_address };
-    int mine_count = (t->trigger_match != TRIG_NONE &&
-                      t->trigger_address != t->static_start) ? 2 : 1;
     for (int i = 0; i < g_trace_count; i++) {
         const TraceSpec *other = &g_traces[i];
         if (other->module == NULL || strcmp(t->module, other->module) != 0) {
             continue;
         }
-        uint64_t theirs[2] = { other->static_start, other->trigger_address };
-        int their_count = (other->trigger_match != TRIG_NONE &&
-                           other->trigger_address != other->static_start) ? 2 : 1;
-        for (int m = 0; m < mine_count; m++) {
-            for (int n = 0; n < their_count; n++) {
-                if (hook_patches_overlap(mine[m], theirs[n])) {
+        for (int m = -1; m < t->trigger_count; m++) {
+            uint64_t mine = m < 0 ? t->static_start : t->triggers[m].address;
+            if (m >= 0 && mine == t->static_start) continue;
+            bool mine_dup = false;
+            for (int p = 0; p < m; p++) {
+                if (t->triggers[p].address == mine) mine_dup = true;
+            }
+            if (mine_dup) continue;
+            for (int n = -1; n < other->trigger_count; n++) {
+                uint64_t theirs = n < 0 ? other->static_start
+                                        : other->triggers[n].address;
+                if (n >= 0 && theirs == other->static_start) continue;
+                if (hook_patches_overlap(mine, theirs)) {
                     if (other_slot) *other_slot = i;
-                    if (this_address) *this_address = mine[m];
-                    if (other_address) *other_address = theirs[n];
+                    if (this_address) *this_address = mine;
+                    if (other_address) *other_address = theirs;
                     return true;
                 }
             }
@@ -416,45 +478,78 @@ static void install_slot(int slot) {
         return;
     }
     uint64_t start_abs = base + t->static_start;
-    uint64_t trigger_abs = base + t->trigger_address;
     uint64_t conflict = 0;
-    if (installed_hook_conflict(start_abs, &conflict) ||
-        (t->trigger_match != TRIG_NONE &&
-         t->trigger_address != t->static_start &&
-         installed_hook_conflict(trigger_abs, &conflict))) {
+    if (installed_hook_conflict(start_abs, &conflict)) {
         qbdi_trace_logf(
             "[engine] hook install rejected: %s slot %d target near existing "
             "absolute hook 0x%llx\n",
             t->module, slot, (unsigned long long)conflict);
         return;
     }
+    int external_count = 0;
+    for (int i = 0; i < t->trigger_count; i++) {
+        uint64_t address = t->triggers[i].address;
+        if (address == t->static_start) continue;
+        bool duplicate = false;
+        for (int j = 0; j < i; j++) {
+            if (t->triggers[j].address == address) duplicate = true;
+        }
+        if (duplicate) continue;
+        external_count++;
+        if (installed_hook_conflict(base + address, &conflict)) {
+            qbdi_trace_logf(
+                "[engine] trigger hook rejected: %s+0x%llx near existing "
+                "absolute hook 0x%llx\n",
+                t->module, (unsigned long long)address,
+                (unsigned long long)conflict);
+            return;
+        }
+    }
+    if (g_trigger_hook_count + external_count > TRACE_MAX_TRIGGER_HOOKS) {
+        qbdi_trace_logf(
+            "[engine] hook install rejected: need %d external trigger hooks, "
+            "only %d trampoline slots remain; same-address conditions can share one\n",
+            external_count, TRACE_MAX_TRIGGER_HOOKS - g_trigger_hook_count);
+        return;
+    }
     /* trigger hook 先装时也能安全透传；只有 start origin 就绪后才允许授权。 */
     g_module_base[slot] = base;
-    /* 自定义触发点必须先装好。若它失败，不再装 start hook，
-     * 避免表面上 hook 成功但永远等不到触发的半失效状态。 */
-    if (t->trigger_match != TRIG_NONE &&
-        t->trigger_address != t->static_start) {
-        void *trigger_target =
-            (void *)(uintptr_t)(base + t->trigger_address);
+    /* 每个不同的外部地址只装一次；同地址的任意多条条件由入口一次求值。 */
+    for (int i = 0; i < t->trigger_count; i++) {
+        uint64_t address = t->triggers[i].address;
+        if (address == t->static_start) continue;
+        bool duplicate = false;
+        for (int j = 0; j < i; j++) {
+            if (t->triggers[j].address == address) duplicate = true;
+        }
+        if (duplicate) continue;
+        int hook_slot = g_trigger_hook_count;
+        void *trigger_target = (void *)(uintptr_t)(base + address);
         void *trigger_origin = NULL;
         qbdi_trace_logf(
-            "[engine] installing trigger hook: slot=%d target=%s+0x%llx\n",
-            slot, t->module, (unsigned long long)t->trigger_address);
-        int trc = DobbyHook(trigger_target, (void *)g_trigger_tramps[slot],
+            "[engine] installing trigger hook: trace=%d hook=%d target=%s+0x%llx\n",
+            slot, hook_slot, t->module, (unsigned long long)address);
+        g_trigger_trace_slot[hook_slot] = slot;
+        g_trigger_address[hook_slot] = address;
+        int trc = DobbyHook(trigger_target, (void *)g_trigger_tramps[hook_slot],
                             &trigger_origin);
         if (trc != 0 || trigger_origin == NULL) {
             qbdi_trace_logf(
                 "[engine] trigger DobbyHook failed(%d): %s+0x%llx "
-                "(slot %d); start hook not installed\n",
-                trc, t->module, (unsigned long long)t->trigger_address, slot);
+                "(trace %d hook %d); start hook not installed\n",
+                trc, t->module, (unsigned long long)address, slot, hook_slot);
+            g_trigger_trace_slot[hook_slot] = -1;
+            g_trigger_address[hook_slot] = 0;
             return;
         }
-        g_trigger_origin[slot] = trigger_origin;
-        remember_installed_hook(trigger_abs);
+        g_trigger_origin[hook_slot] = trigger_origin;
+        remember_installed_hook(base + address);
+        g_trigger_hook_count++;
         qbdi_trace_logf(
-            "[engine] trigger hooked %s+0x%llx @ %p (slot %d, origin=%p)\n",
-            t->module, (unsigned long long)t->trigger_address,
-            trigger_target, slot, trigger_origin);
+            "[engine] trigger hooked %s+0x%llx @ %p "
+            "(trace %d hook %d, origin=%p)\n",
+            t->module, (unsigned long long)address,
+            trigger_target, slot, hook_slot, trigger_origin);
     }
     void *target = (void *)(uintptr_t)(base + t->static_start);
     void *origin = NULL;
@@ -587,6 +682,12 @@ void engine_start(void) {
                 memset(t, 0, sizeof(*t));
                 continue;
             }
+            if (t->count < 1 || t->count > 16) {
+                qbdi_trace_logf("[engine] skip item (slot %d): count must be 1..16, got %d\n",
+                                slot, t->count);
+                memset(t, 0, sizeof(*t));
+                continue;
+            }
             /* 区间短于 Dobby 补丁长度时,end 落在 [start, start+0x10) 里 —— 那几条指令
              * 在真实内存里已被补丁覆盖,QBDI 跑的是 origin 里的副本,PC 永远不会等于 end,
              * 于是停不下来、一路执行到崩。这种配置必须拒掉,不能让它跑。 */
@@ -601,7 +702,7 @@ void engine_start(void) {
                 continue;
             }
             char terr[96];
-            if (!load_trigger(it, t, terr, sizeof(terr))) {
+            if (!load_triggers(it, t, terr, sizeof(terr))) {
                 /* 条件配错就拒整条:否则过滤静默失效,日志里全是本该被滤掉的内容 */
                 qbdi_trace_logf("[engine] skip item (slot %d): bad trigger: %s\n",
                                 slot, terr);
@@ -620,14 +721,15 @@ void engine_start(void) {
                 memset(t, 0, sizeof(*t));
                 continue;
             }
-            if (t->trigger_match != TRIG_NONE) {
-                qbdi_trace_logf("[%s] trigger: %s (%s) at 0x%llx\n", t->module,
-                                t->trigger_expr,
-                                t->trigger_match == TRIG_NOTNULL ? "notnull"
-                                : t->trigger_match == TRIG_BYTES ? "bytes"
-                                : t->trigger_match == TRIG_CSTR  ? "cstr"
-                                                                 : "u64",
-                                (unsigned long long)t->trigger_address);
+            for (int i = 0; i < t->trigger_count; i++) {
+                TraceTrigger *tr = &t->triggers[i];
+                qbdi_trace_logf("[%s] trigger[%d]: %s (%s) at 0x%llx policy=%s\n",
+                                t->module, i + 1, tr->expr,
+                                tr->match == TRIG_NOTNULL ? "notnull"
+                                : tr->match == TRIG_BYTES ? "bytes"
+                                : tr->match == TRIG_CSTR  ? "cstr" : "u64",
+                                (unsigned long long)tr->address,
+                                t->trigger_once ? "once" : "repeat");
             }
             load_watches(it[@"watches"]);
             g_trace_count++;

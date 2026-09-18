@@ -25,6 +25,22 @@ typedef enum {
 #define TRIG_MAX_SCAN  0x1000 /* 「包含」的搜索窗口硬上限 4KB */
 #define TRIG_DEF_SCAN  0x100  /* 默认窗口 256 字节 */
 
+/* 一条触发条件。条件数组按 JSON 顺序保存；相同 address 共享一个 Dobby hook。 */
+typedef struct {
+    uint64_t    address;                        /* 模块相对偏移；缺省=trace start */
+    const char *expr;                           /* 表达式原文(仅用于日志) */
+    WatchExpr   cexpr;                          /* 编译后的取址表达式 */
+    TrigMatch   match;
+    TrigWhere   where;
+    uint32_t    scan;
+    uint8_t     want_bytes[TRIG_MAX_BYTES];
+    int         want_nbytes;
+    uint64_t    want_u64;
+    int         consume_state;                  /* 原子状态:0 可用,1 占用中,2 已消耗 */
+    uint64_t    filtered;                       /* 不匹配次数(指数退避日志) */
+    uint64_t    next_log;
+} TraceTrigger;
+
 /* 一条 trace 区间(运行期由 engine.m 从 JSON 填充) */
 typedef struct {
     const char *trace_name;   /* 用户自定义名称,仅用于诊断日志,可为 NULL */
@@ -37,18 +53,9 @@ typedef struct {
     uint64_t    log_mask;     /* LOG_INST|LOG_MEM|LOG_REGS|LOG_BRANCH */
     uint64_t    max_instructions; /* 0=不截断,否则到上限后停止本次 QBDI */
 
-    /* 触发条件:缺省在 static_start 用输入寄存器求值。
-     * trigger_address != static_start 时另装一个 Dobby hook，匹配后授权
-     * 同一线程下一次进入 static_start 开始 trace。TRIG_NONE 时下面无意义。 */
-    uint64_t    trigger_address;                 /* 模块相对偏移；缺省=static_start */
-    const char *trigger_expr;                    /* 表达式原文(仅用于日志) */
-    WatchExpr   trigger_cexpr;                   /* 编译后的取址表达式 */
-    TrigMatch   trigger_match;
-    TrigWhere   trigger_where;                   /* 开头 / 包含 */
-    uint32_t    trigger_scan;                    /* 「包含」的读取上限,≤ TRIG_MAX_SCAN */
-    uint8_t     want_bytes[TRIG_MAX_BYTES];      /* TRIG_BYTES/TRIG_CSTR 的期望内容 */
-    int         want_nbytes;
-    uint64_t    want_u64;                        /* TRIG_U64 的期望值 */
+    TraceTrigger *triggers;                      /* 0 条 = 无条件 */
+    int           trigger_count;                 /* 条件数量不设产品层上限 */
+    int           trigger_once;                  /* 1=成功后各条件只生效一次 */
 } TraceSpec;
 
 typedef struct {

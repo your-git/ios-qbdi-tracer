@@ -10,7 +10,8 @@ static NSArray *RegNames(void) {
     return a;
 }
 static NSArray *ActionNames(void) {
-    return @[ @"cstr", @"utf8", @"u32", @"u64", @"hexdump", @"objc" ];
+    /* 引擎仍保留 objc/po 兼容旧 JSON，但新配置不再暴露这个不稳定选项。 */
+    return @[ @"cstr", @"utf8", @"u32", @"u64", @"hexdump" ];
 }
 
 #pragma mark -
