@@ -24,6 +24,8 @@ static BOOL traceEnabled(NSDictionary *item) {
 - (void)reloadItem:(NSMutableDictionary *)item;
 - (void)renameItem:(NSMutableDictionary *)item
               done:(void (^)(BOOL))done;
+- (void)showNotices;
+- (void)showTriggerNotice;
 @end
 
 @implementation RootListVC
@@ -61,6 +63,11 @@ static BOOL traceEnabled(NSDictionary *item) {
         [UIAlertController alertControllerWithTitle:@"帮助"
                                             message:nil
                                      preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"注意事项"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+              [self showNotices];
+          }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"查看 Trace 日志输出位置"
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) {
@@ -416,6 +423,43 @@ static BOOL traceEnabled(NSDictionary *item) {
             }
         });
     }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)showNotices {
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:@"注意事项"
+                                            message:nil
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"触发条件"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+              [self showTriggerNotice];
+          }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"关闭"
+                                           style:UIAlertActionStyleCancel
+                                         handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)showTriggerNotice {
+    NSString *message =
+        @"1. 判断地址留空时，使用 Trace 起始地址，并在起始 Hook 处判断。\n\n"
+        @"2. 自定义判断地址可以低于起始地址，也可以等于或高于结束地址；"
+        @"不能位于起始地址和结束地址之间。\n\n"
+        @"3. 自定义判断地址命中后，只会授权同一线程下一次到达起始地址时 Trace。"
+        @"因此高地址可用于程序之后跳回低地址的流程。\n\n"
+        @"4. ARM64 下 Dobby Hook 补丁占 0x10 字节。判断地址低于起始地址时，"
+        @"两者必须至少间隔 0x10，否则补丁会重叠。\n\n"
+        @"5. 自定义判断地址也会安装 Dobby Hook。请尽量选择不会在 Trace 动态调用路径中"
+        @"再次执行的控制流位置，避免 Dobby 补丁影响 QBDI 对该路径的执行。";
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"触发条件注意事项"
+                         message:message
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"关闭"
+                                           style:UIAlertActionStyleCancel
+                                         handler:nil]];
     [self presentViewController:ac animated:YES completion:nil];
 }
 

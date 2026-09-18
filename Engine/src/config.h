@@ -37,8 +37,10 @@ typedef struct {
     uint64_t    log_mask;     /* LOG_INST|LOG_MEM|LOG_REGS|LOG_BRANCH */
     uint64_t    max_instructions; /* 0=不截断,否则到上限后停止本次 QBDI */
 
-    /* 触发条件:在 hook 点(static_start)用输入寄存器求值,不匹配就透传 ——
-     * 不写日志、不消耗 count、不启动 QBDI。TRIG_NONE 时下面的字段都无意义。 */
+    /* 触发条件:缺省在 static_start 用输入寄存器求值。
+     * trigger_address != static_start 时另装一个 Dobby hook，匹配后授权
+     * 同一线程下一次进入 static_start 开始 trace。TRIG_NONE 时下面无意义。 */
+    uint64_t    trigger_address;                 /* 模块相对偏移；缺省=static_start */
     const char *trigger_expr;                    /* 表达式原文(仅用于日志) */
     WatchExpr   trigger_cexpr;                   /* 编译后的取址表达式 */
     TrigMatch   trigger_match;

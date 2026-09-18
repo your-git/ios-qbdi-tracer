@@ -39,9 +39,14 @@
  * 与 Engine/src/qbdi_trace.h 的 QBDI_PATCH_SIZE 对应。 */
 #define TRACE_MIN_RANGE 0x10
 
+static unsigned long long HexValue(id v);
+
 @interface TraceEditVC () <UITextFieldDelegate>
 @property (nonatomic, strong) NSMutableDictionary *item;
 @property (nonatomic, assign) BOOL isNew;
+- (void)addressFieldChanged:(UITextField *)field;
+- (BOOL)triggerAddressValue:(unsigned long long)value
+                     reason:(NSString **)reason;
 @end
 
 @implementation TraceEditVC
@@ -128,6 +133,7 @@ typedef NS_ENUM(NSInteger, TrigWhereKind) {
 /* 「触发条件」段的行(顺序即显示顺序,按匹配方式伸缩) */
 typedef NS_ENUM(NSInteger, TrigRowKind) {
     TrigRowExpr = 0,
+    TrigRowAddress,
     TrigRowMatch,
     TrigRowWhere,
     TrigRowValue,
@@ -175,14 +181,16 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     }
     TrigMatchKind k = [self triggerMatch];
     if (k == TrigMatchNotNull) {
-        return @[ @(TrigRowExpr), @(TrigRowMatch), @(TrigRowClear) ];
-    }
-    if (k == TrigMatchU64) {
-        return @[ @(TrigRowExpr), @(TrigRowMatch), @(TrigRowValue),
+        return @[ @(TrigRowExpr), @(TrigRowAddress), @(TrigRowMatch),
                   @(TrigRowClear) ];
     }
+    if (k == TrigMatchU64) {
+        return @[ @(TrigRowExpr), @(TrigRowAddress), @(TrigRowMatch),
+                  @(TrigRowValue), @(TrigRowClear) ];
+    }
     /* 字节 / 字符串:多一个「匹配位置」,选了「包含」再多一个「最长读取」 */
-    NSMutableArray *rows = [@[ @(TrigRowExpr), @(TrigRowMatch), @(TrigRowWhere),
+    NSMutableArray *rows = [@[ @(TrigRowExpr), @(TrigRowAddress),
+                               @(TrigRowMatch), @(TrigRowWhere),
                                @(TrigRowValue) ] mutableCopy];
     if ([self triggerWhere] == TrigWhereContains) {
         [rows addObject:@(TrigRowScan)];
@@ -211,6 +219,15 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
                               placeholder:(k == TrigMatchBytes ? @"08a48c90"
                                            : k == TrigMatchCstr ? @"api"
                                                                 : @"0x...")
+                                  numeric:NO];
+        c.field.font = [UIFont monospacedSystemFontOfSize:15
+                                                   weight:UIFontWeightRegular];
+        return c;
+    }
+    if (kind == TrigRowAddress) {
+        FieldCell *c = [self fieldCellKey:@"triggerAddress"
+                                    label:@"判断地址"
+                              placeholder:@"默认：起始地址"
                                   numeric:NO];
         c.field.font = [UIFont monospacedSystemFontOfSize:15
                                                    weight:UIFontWeightRegular];
@@ -273,9 +290,10 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
+    NSUInteger whereRow = [[self triggerRows] indexOfObject:@(TrigRowWhere)];
     sheet.popoverPresentationController.sourceView =
-        [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:2
-                                                                inSection:3]];
+        [self.tableView cellForRowAtIndexPath:
+            [NSIndexPath indexPathForRow:(NSInteger)whereRow inSection:3]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
 
@@ -302,6 +320,7 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     [self.item removeObjectForKey:@"triggerValue"];
     [self.item removeObjectForKey:@"triggerWhere"];
     [self.item removeObjectForKey:@"triggerScan"];
+    [self.item removeObjectForKey:@"triggerAddress"];
     [self.tableView reloadData];
     [self updatePopGesture];
 }
@@ -326,9 +345,10 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
+    NSUInteger matchRow = [[self triggerRows] indexOfObject:@(TrigRowMatch)];
     sheet.popoverPresentationController.sourceView =
-        [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:1
-                                                                inSection:3]];
+        [self.tableView cellForRowAtIndexPath:
+            [NSIndexPath indexPathForRow:(NSInteger)matchRow inSection:3]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
 
@@ -362,25 +382,32 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
             return @"留空 = 每次命中都 trace。填了表达式后,只有内存内容匹配时才记录,"
                    @"不匹配的调用完全不写 trace 文件,并会继续等待后续匹配。";
         }
+        NSString *addressNote =
+            @"判断地址留空=起始地址；自定义地址不能在起始与结束之间，"
+            @"低于起始时至少间隔 0x10。命中后等待同一线程下一次到达起始地址。\n\n";
         BOOL contains = [self triggerWhere] == TrigWhereContains;
         if ([self triggerMatch] == TrigMatchBytes) {
-            return contains
+            NSString *detail = contains
                 ? @"从这个地址最多读「最长读取」个字节,在里面搜这串字节。"
                   @"字节按内存顺序写 —— 和 hexdump 里看到的顺序一致。例:08a48c90"
                 : @"只比开头:读这串字节那么长,逐字节相等才算命中。"
                   @"按内存顺序写,和 hexdump 里看到的一致。例:08a48c90";
+            return [addressNote stringByAppendingString:detail];
         }
         if ([self triggerMatch] == TrigMatchCstr) {
-            return contains
+            NSString *detail = contains
                 ? @"先把字符串完整读出来(读到 \0 为止、最多「最长读取」个字节),"
                   @"再看里面是否包含这段文字。"
                 : @"只比开头:字符串以这段文字开头才算命中。例:https://";
+            return [addressNote stringByAppendingString:detail];
         }
         if ([self triggerMatch] == TrigMatchU64) {
-            return @"读 8 字节按小端当整数比较。注意和「字节」相反:"
-                   @"内存里的 08 a4 8c 90 81 04 10 02 在这里要写成 0x02100481908ca408。";
+            return [addressNote stringByAppendingString:
+                @"读 8 字节按小端当整数比较。注意和「字节」相反:"
+                @"内存里的 08 a4 8c 90 81 04 10 02 在这里要写成 0x02100481908ca408。"];
         }
-        return @"地址可读且非 0 就算命中 —— 用来滤掉那些 (null) 的调用。";
+        return [addressNote stringByAppendingString:
+            @"地址可读且非 0 就算命中 —— 用来滤掉那些 (null) 的调用。"];
     }
     return nil;
 }
@@ -482,6 +509,12 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(c.field, "numeric", @(numeric),
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if ([key isEqualToString:@"start"] || [key isEqualToString:@"end"] ||
+        [key isEqualToString:@"triggerAddress"]) {
+        AttachHexKeyboard(c.field);
+        [c.field addTarget:self action:@selector(addressFieldChanged:)
+          forControlEvents:UIControlEventEditingChanged];
+    }
     return c;
 }
 
@@ -490,6 +523,26 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
 - (void)textFieldDidEndEditing:(UITextField *)tf {
     NSString *key = objc_getAssociatedObject(tf, "cfgKey");
     if (key == nil) return;
+    if ([key isEqualToString:@"start"] || [key isEqualToString:@"end"] ||
+        [key isEqualToString:@"triggerAddress"]) {
+        NSString *text = [tf.text stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([key isEqualToString:@"triggerAddress"] && text.length == 0) {
+            [self.item removeObjectForKey:key];
+            tf.text = @"";
+        } else {
+            unsigned long long value = 0;
+            if (HexParseInput(text, &value)) {
+                NSString *normalized = [NSString stringWithFormat:@"0x%llx", value];
+                self.item[key] = normalized;
+                tf.text = normalized;
+            } else {
+                self.item[key] = text ?: @"";
+            }
+        }
+        [self addressFieldChanged:tf];
+        return;
+    }
     if ([key isEqualToString:@"triggerScan"]) {
         /* 一律按十六进制读,写回时带 0x —— 与 watch 的 size 同一套规则 */
         unsigned long long n = 0;
@@ -507,6 +560,45 @@ typedef NS_ENUM(NSInteger, TrigRowKind) {
         self.item[key] = @([tf.text integerValue]);
     } else {
         self.item[key] = tf.text ?: @"";
+    }
+    [self updatePopGesture];
+}
+
+- (BOOL)triggerAddressValue:(unsigned long long)value
+                     reason:(NSString **)reason {
+    unsigned long long start = HexValue(self.item[@"start"]);
+    unsigned long long end = HexValue(self.item[@"end"]);
+    if (value > start && value < end) {
+        if (reason) *reason = @"判断地址不能位于起始地址与结束地址之间。";
+        return NO;
+    }
+    if (value < start && start - value < TRACE_MIN_RANGE) {
+        if (reason) {
+            *reason = [NSString stringWithFormat:
+                @"判断地址与起始地址太近。Dobby Hook 至少需要间隔 0x%x 字节。",
+                TRACE_MIN_RANGE];
+        }
+        return NO;
+    }
+    return YES;
+}
+
+- (void)addressFieldChanged:(UITextField *)field {
+    NSString *key = objc_getAssociatedObject(field, "cfgKey");
+    if (key.length == 0) return;
+    NSString *text = [field.text stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([key isEqualToString:@"triggerAddress"] && text.length == 0) {
+        [self.item removeObjectForKey:key];
+        field.textColor = [UIColor labelColor];
+    } else {
+        self.item[key] = text ?: @"";
+        unsigned long long value = 0;
+        BOOL valid = text.length > 0 && HexParseInput(text, &value);
+        if (valid && [key isEqualToString:@"triggerAddress"]) {
+            valid = [self triggerAddressValue:value reason:nil];
+        }
+        field.textColor = valid ? [UIColor labelColor] : [UIColor systemRedColor];
     }
     [self updatePopGesture];
 }
@@ -622,8 +714,15 @@ static unsigned long long HexValue(id v) {
 
     /* 区间太短的话引擎那边会直接拒掉(见 Engine/src/engine.m),这里先挡一道,
      * 省掉"装上、跑一遍、翻日志"才知道配错了的一轮 */
-    unsigned long long start = HexValue(self.item[@"start"]);
-    unsigned long long end = HexValue(self.item[@"end"]);
+    NSString *startText = [self.item[@"start"] description];
+    NSString *endText = [self.item[@"end"] description];
+    unsigned long long start = 0, end = 0;
+    if (startText.length == 0 || endText.length == 0 ||
+        !HexParseInput(startText, &start) || !HexParseInput(endText, &end)) {
+        [self alert:@"地址无效"
+                msg:@"起始地址和结束地址只能包含 0X、0-9 和 A-F。"];
+        return;
+    }
     if (end <= start) {
         [self alert:@"地址无效" msg:@"结束地址必须大于起始地址。"];
         return;
@@ -640,6 +739,21 @@ static unsigned long long HexValue(id v) {
 
     /* 触发条件:表达式语法 + 期望值格式,配错了引擎会拒掉整条 trace,这里先挡 */
     if ([self hasTrigger]) {
+        id triggerAddress = self.item[@"triggerAddress"];
+        if ([triggerAddress isKindOfClass:[NSString class]] &&
+            [triggerAddress length] > 0) {
+            unsigned long long address = 0;
+            if (!HexParseInput(triggerAddress, &address)) {
+                [self alert:@"判断地址无效"
+                        msg:@"判断地址只能包含 0X、0-9 和 A-F。"];
+                return;
+            }
+            NSString *reason = nil;
+            if (![self triggerAddressValue:address reason:&reason]) {
+                [self alert:@"判断地址无效" msg:reason];
+                return;
+            }
+        }
         NSString *expr = self.item[@"triggerExpr"];
         if (!ExprSyntaxOK(expr)) {
             [self alert:@"触发条件无效"

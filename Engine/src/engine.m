@@ -14,6 +14,11 @@ int        g_trace_count = 0;
 TraceWatch g_watches[TRACE_MAX_WATCHES];
 int        g_watch_count = 0;
 
+/* 已成功安装的 Dobby 补丁绝对地址。配置中的模块名是子串，两个不同字符串
+ * 也可能匹配到同一镜像，所以装 Hook 前还要用绝对地址再挡一道。 */
+static uint64_t g_installed_hook_targets[TRACE_MAX_TARGETS * 2];
+static int g_installed_hook_count;
+
 /* 控制 App 自己的 bundleId:引擎注入到它时要跳过(不自钩) */
 #define GUI_BUNDLE_ID @"com.snk.qbditracer"
 
@@ -60,6 +65,28 @@ static uint64_t parse_hex(id v) {
         return 0;
     }
     return (uint64_t)strtoull(s, NULL, 16);
+}
+
+/* 地址字段的严格解析：不允许把 "12zz" 静默当成 0x12。 */
+static bool parse_hex_strict(id v, uint64_t *out) {
+    if (out == NULL) return false;
+    if ([v isKindOfClass:[NSNumber class]]) {
+        *out = (uint64_t)[v unsignedLongLongValue];
+        return true;
+    }
+    if (![v isKindOfClass:[NSString class]]) return false;
+    const char *s = [v UTF8String];
+    if (s == NULL) return false;
+    while (*s == ' ' || *s == '\t') s++;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    if (*s == '\0') return false;
+    char *end = NULL;
+    unsigned long long n = strtoull(s, &end, 16);
+    if (end == s) return false;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\0') return false;
+    *out = (uint64_t)n;
+    return true;
 }
 
 /* size 字段专用:带 "0x" 前缀按十六进制,不带按十进制。
@@ -118,6 +145,7 @@ static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errca
     t->trigger_expr  = NULL;
     t->want_nbytes   = 0;
     t->want_u64      = 0;
+    t->trigger_address = t->static_start;
     memset(&t->trigger_cexpr, 0, sizeof(t->trigger_cexpr));
 
     const char *expr = dup_str(it[@"triggerExpr"]);
@@ -129,6 +157,35 @@ static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errca
         return false;
     }
     t->trigger_expr = expr;
+
+    id address = it[@"triggerAddress"];
+    if ([address isKindOfClass:[NSString class]] && [address length] == 0) {
+        address = nil; /* App 里留空 = 起始地址 */
+    }
+    if (address != nil && !parse_hex_strict(address, &t->trigger_address)) {
+        snprintf(err, errcap, "triggerAddress is not a valid hex address");
+        return false;
+    }
+    /* 等于 start 沿用原 hook；其余地址必须在数值区间外。
+     * 低于 start 时还要避免两个 0x10 字节的 Dobby 补丁重叠。 */
+    if (t->trigger_address > t->static_start &&
+        t->trigger_address < t->static_end) {
+        snprintf(err, errcap,
+                 "triggerAddress 0x%llx is inside trace range (0x%llx, 0x%llx)",
+                 (unsigned long long)t->trigger_address,
+                 (unsigned long long)t->static_start,
+                 (unsigned long long)t->static_end);
+        return false;
+    }
+    if (t->trigger_address < t->static_start &&
+        t->static_start - t->trigger_address < QBDI_PATCH_SIZE) {
+        snprintf(err, errcap,
+                 "triggerAddress 0x%llx is too close to start 0x%llx; "
+                 "Dobby hooks need at least 0x%x bytes",
+                 (unsigned long long)t->trigger_address,
+                 (unsigned long long)t->static_start, QBDI_PATCH_SIZE);
+        return false;
+    }
 
     NSString *m = [it[@"triggerMatch"] isKindOfClass:[NSString class]]
                       ? it[@"triggerMatch"] : @"notnull";
@@ -250,6 +307,60 @@ static bool load_trigger(NSDictionary *it, TraceSpec *t, char *err, size_t errca
     return false;
 }
 
+static bool hook_patches_overlap(uint64_t a, uint64_t b) {
+    uint64_t hi = a > b ? a : b;
+    uint64_t lo = a > b ? b : a;
+    return hi - lo < QBDI_PATCH_SIZE;
+}
+
+static bool installed_hook_conflict(uint64_t target, uint64_t *existing) {
+    for (int i = 0; i < g_installed_hook_count; i++) {
+        if (hook_patches_overlap(target, g_installed_hook_targets[i])) {
+            if (existing) *existing = g_installed_hook_targets[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static void remember_installed_hook(uint64_t target) {
+    int cap = (int)(sizeof(g_installed_hook_targets) /
+                    sizeof(g_installed_hook_targets[0]));
+    if (g_installed_hook_count < cap) {
+        g_installed_hook_targets[g_installed_hook_count++] = target;
+    }
+}
+
+/* Dobby 在每个目标地址覆盖 0x10 字节。既要防本条的 trigger/start
+ * 互相覆盖，也要防不同条目的 start/trigger 重叠。 */
+static bool find_hook_conflict(const TraceSpec *t, int *other_slot,
+                               uint64_t *this_address,
+                               uint64_t *other_address) {
+    uint64_t mine[2] = { t->static_start, t->trigger_address };
+    int mine_count = (t->trigger_match != TRIG_NONE &&
+                      t->trigger_address != t->static_start) ? 2 : 1;
+    for (int i = 0; i < g_trace_count; i++) {
+        const TraceSpec *other = &g_traces[i];
+        if (other->module == NULL || strcmp(t->module, other->module) != 0) {
+            continue;
+        }
+        uint64_t theirs[2] = { other->static_start, other->trigger_address };
+        int their_count = (other->trigger_match != TRIG_NONE &&
+                           other->trigger_address != other->static_start) ? 2 : 1;
+        for (int m = 0; m < mine_count; m++) {
+            for (int n = 0; n < their_count; n++) {
+                if (hook_patches_overlap(mine[m], theirs[n])) {
+                    if (other_slot) *other_slot = i;
+                    if (this_address) *this_address = mine[m];
+                    if (other_address) *other_address = theirs[n];
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 /* 把一条 item 的 watches 填进全局 g_watches */
 static void load_watches(NSArray *warr) {
     if (![warr isKindOfClass:[NSArray class]]) {
@@ -304,6 +415,47 @@ static void install_slot(int slot) {
         qbdi_trace_logf("[engine] module not found: %s (slot %d)\n", t->module, slot);
         return;
     }
+    uint64_t start_abs = base + t->static_start;
+    uint64_t trigger_abs = base + t->trigger_address;
+    uint64_t conflict = 0;
+    if (installed_hook_conflict(start_abs, &conflict) ||
+        (t->trigger_match != TRIG_NONE &&
+         t->trigger_address != t->static_start &&
+         installed_hook_conflict(trigger_abs, &conflict))) {
+        qbdi_trace_logf(
+            "[engine] hook install rejected: %s slot %d target near existing "
+            "absolute hook 0x%llx\n",
+            t->module, slot, (unsigned long long)conflict);
+        return;
+    }
+    /* trigger hook 先装时也能安全透传；只有 start origin 就绪后才允许授权。 */
+    g_module_base[slot] = base;
+    /* 自定义触发点必须先装好。若它失败，不再装 start hook，
+     * 避免表面上 hook 成功但永远等不到触发的半失效状态。 */
+    if (t->trigger_match != TRIG_NONE &&
+        t->trigger_address != t->static_start) {
+        void *trigger_target =
+            (void *)(uintptr_t)(base + t->trigger_address);
+        void *trigger_origin = NULL;
+        qbdi_trace_logf(
+            "[engine] installing trigger hook: slot=%d target=%s+0x%llx\n",
+            slot, t->module, (unsigned long long)t->trigger_address);
+        int trc = DobbyHook(trigger_target, (void *)g_trigger_tramps[slot],
+                            &trigger_origin);
+        if (trc != 0 || trigger_origin == NULL) {
+            qbdi_trace_logf(
+                "[engine] trigger DobbyHook failed(%d): %s+0x%llx "
+                "(slot %d); start hook not installed\n",
+                trc, t->module, (unsigned long long)t->trigger_address, slot);
+            return;
+        }
+        g_trigger_origin[slot] = trigger_origin;
+        remember_installed_hook(trigger_abs);
+        qbdi_trace_logf(
+            "[engine] trigger hooked %s+0x%llx @ %p (slot %d, origin=%p)\n",
+            t->module, (unsigned long long)t->trigger_address,
+            trigger_target, slot, trigger_origin);
+    }
     void *target = (void *)(uintptr_t)(base + t->static_start);
     void *origin = NULL;
     int rc = DobbyHook(target, (void *)g_tramps[slot], &origin);
@@ -312,6 +464,7 @@ static void install_slot(int slot) {
          * find_module(遍历 dyld 镜像 + 抢 dyld 锁,热点上会拖死整个进程) */
         g_module_base[slot] = base;
         g_origin[slot] = origin;
+        remember_installed_hook(start_abs);
         qbdi_trace_logf("[engine] hooked %s+0x%llx @ %p (slot %d, origin=%p)\n",
                         t->module, (unsigned long long)t->static_start, target,
                         slot, origin);
@@ -455,13 +608,26 @@ void engine_start(void) {
                 memset(t, 0, sizeof(*t));
                 continue;
             }
+            int conflict_slot = -1;
+            uint64_t this_hook = 0, other_hook = 0;
+            if (find_hook_conflict(t, &conflict_slot, &this_hook, &other_hook)) {
+                qbdi_trace_logf(
+                    "[engine] skip item (slot %d): Dobby hook %s+0x%llx "
+                    "overlaps slot %d hook at 0x%llx (patch size 0x%x)\n",
+                    slot, t->module, (unsigned long long)this_hook,
+                    conflict_slot, (unsigned long long)other_hook,
+                    QBDI_PATCH_SIZE);
+                memset(t, 0, sizeof(*t));
+                continue;
+            }
             if (t->trigger_match != TRIG_NONE) {
-                qbdi_trace_logf("[%s] trigger: %s (%s)\n", t->module,
+                qbdi_trace_logf("[%s] trigger: %s (%s) at 0x%llx\n", t->module,
                                 t->trigger_expr,
                                 t->trigger_match == TRIG_NOTNULL ? "notnull"
                                 : t->trigger_match == TRIG_BYTES ? "bytes"
                                 : t->trigger_match == TRIG_CSTR  ? "cstr"
-                                                                 : "u64");
+                                                                 : "u64",
+                                (unsigned long long)t->trigger_address);
             }
             load_watches(it[@"watches"]);
             g_trace_count++;

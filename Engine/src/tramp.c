@@ -16,7 +16,8 @@
 #endif
 
 /*
- * 固定 32 个 naked arm64 trampoline(槽位 0..31)。
+ * 每类固定 32 个 naked arm64 trampoline(槽位 0..31):
+ * trace 入口和自定义 trigger 入口各一组。
  * 与编译期 X-macro 版不同:数量固定,运行期由 engine.m 决定 hook 哪几个槽位。
  * 每个 trampoline 只差 `mov x1, #slot`(asm 要求字面量,故必须逐个展开)。
  *
@@ -45,11 +46,11 @@
  *
  * 恢复顺序有讲究:`msr nzcv` 必须排在恢复通用寄存器**之前**(借 x9 当临时寄存器),
  * 因为之后的 ldp/ldr/mov sp/br 都不会碰标志位,而 x9 随后会被还原成原值。
- * `trace_ctx_entry` 的返回值必须留在 x17 直到最后 `br x17`；绝不能先放进 x16
+ * C 入口的返回值必须留在 x17 直到最后 `br x17`；绝不能先放进 x16
  * 又用保存值覆盖 x16，否则会跳到 hook 入口时的旧 x16，造成重复进入同一现场。
  */
-#define TRAMP(slot)                                                             \
-    __attribute__((naked)) static void tramp_##slot(void) {                     \
+#define TRAMP(kind, slot, entry)                                                \
+    __attribute__((naked)) static void kind##_tramp_##slot(void) {              \
         __asm__ volatile(                                                        \
             "sub sp, sp, #0x320\n"                                               \
             "stp x0, x1, [sp, #0x00]\n"                                          \
@@ -95,7 +96,7 @@
             "stp q30, q31, [sp, #0x300]\n"                                       \
             "mov x0, sp\n"                                                       \
             "mov x1, #" #slot "\n"                                               \
-            "bl _trace_ctx_entry\n"                                              \
+            "bl _" #entry "\n"                                                  \
             /* x17 是 Dobby 的 arm64 跳板临时寄存器。若 C 层意外返回 0，退到 */    \
             /* hook 现场保存的 LR，至少避免 br 0 立即崩溃。 */                     \
             "mov x17, x0\n"                                                      \
@@ -148,15 +149,42 @@
         );                                                                       \
     }
 
-TRAMP(0)  TRAMP(1)  TRAMP(2)  TRAMP(3)  TRAMP(4)  TRAMP(5)  TRAMP(6)  TRAMP(7)
-TRAMP(8)  TRAMP(9)  TRAMP(10) TRAMP(11) TRAMP(12) TRAMP(13) TRAMP(14) TRAMP(15)
-TRAMP(16) TRAMP(17) TRAMP(18) TRAMP(19) TRAMP(20) TRAMP(21) TRAMP(22) TRAMP(23)
-TRAMP(24) TRAMP(25) TRAMP(26) TRAMP(27) TRAMP(28) TRAMP(29) TRAMP(30) TRAMP(31)
+#define TRACE_TRAMP(slot) TRAMP(trace, slot, trace_ctx_entry)
+TRACE_TRAMP(0)  TRACE_TRAMP(1)  TRACE_TRAMP(2)  TRACE_TRAMP(3)
+TRACE_TRAMP(4)  TRACE_TRAMP(5)  TRACE_TRAMP(6)  TRACE_TRAMP(7)
+TRACE_TRAMP(8)  TRACE_TRAMP(9)  TRACE_TRAMP(10) TRACE_TRAMP(11)
+TRACE_TRAMP(12) TRACE_TRAMP(13) TRACE_TRAMP(14) TRACE_TRAMP(15)
+TRACE_TRAMP(16) TRACE_TRAMP(17) TRACE_TRAMP(18) TRACE_TRAMP(19)
+TRACE_TRAMP(20) TRACE_TRAMP(21) TRACE_TRAMP(22) TRACE_TRAMP(23)
+TRACE_TRAMP(24) TRACE_TRAMP(25) TRACE_TRAMP(26) TRACE_TRAMP(27)
+TRACE_TRAMP(28) TRACE_TRAMP(29) TRACE_TRAMP(30) TRACE_TRAMP(31)
+#undef TRACE_TRAMP
+
+#define TRIGGER_TRAMP(slot) TRAMP(trigger, slot, trigger_ctx_entry)
+TRIGGER_TRAMP(0)  TRIGGER_TRAMP(1)  TRIGGER_TRAMP(2)  TRIGGER_TRAMP(3)
+TRIGGER_TRAMP(4)  TRIGGER_TRAMP(5)  TRIGGER_TRAMP(6)  TRIGGER_TRAMP(7)
+TRIGGER_TRAMP(8)  TRIGGER_TRAMP(9)  TRIGGER_TRAMP(10) TRIGGER_TRAMP(11)
+TRIGGER_TRAMP(12) TRIGGER_TRAMP(13) TRIGGER_TRAMP(14) TRIGGER_TRAMP(15)
+TRIGGER_TRAMP(16) TRIGGER_TRAMP(17) TRIGGER_TRAMP(18) TRIGGER_TRAMP(19)
+TRIGGER_TRAMP(20) TRIGGER_TRAMP(21) TRIGGER_TRAMP(22) TRIGGER_TRAMP(23)
+TRIGGER_TRAMP(24) TRIGGER_TRAMP(25) TRIGGER_TRAMP(26) TRIGGER_TRAMP(27)
+TRIGGER_TRAMP(28) TRIGGER_TRAMP(29) TRIGGER_TRAMP(30) TRIGGER_TRAMP(31)
+#undef TRIGGER_TRAMP
 #undef TRAMP
 
 /* 槽位 → trampoline 函数指针(engine.m 装 hook 时按 slot 取) */
 const void *g_tramps[TRACE_MAX_TARGETS] = {
-#define T(slot) (const void *)tramp_##slot,
+#define T(slot) (const void *)trace_tramp_##slot,
+    T(0)  T(1)  T(2)  T(3)  T(4)  T(5)  T(6)  T(7)
+    T(8)  T(9)  T(10) T(11) T(12) T(13) T(14) T(15)
+    T(16) T(17) T(18) T(19) T(20) T(21) T(22) T(23)
+    T(24) T(25) T(26) T(27) T(28) T(29) T(30) T(31)
+#undef T
+};
+
+/* 自定义触发地址的独立 trampoline，不占用 trace 入口的槽位语义。 */
+const void *g_trigger_tramps[TRACE_MAX_TARGETS] = {
+#define T(slot) (const void *)trigger_tramp_##slot,
     T(0)  T(1)  T(2)  T(3)  T(4)  T(5)  T(6)  T(7)
     T(8)  T(9)  T(10) T(11) T(12) T(13) T(14) T(15)
     T(16) T(17) T(18) T(19) T(20) T(21) T(22) T(23)

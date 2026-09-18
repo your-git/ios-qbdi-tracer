@@ -4,7 +4,7 @@
  * 顶层: { enabled: bool, items: [ item... ] }
  * item:  { id, enabled, traceName(可选), bundleId, appName, module, start, end, count,
  *          moduleOnly, delaySecs, logMask, maxInstructions(可选,0=不限制),
- *          triggerExpr, triggerMatch, triggerValue,
+ *          triggerExpr, triggerAddress, triggerMatch, triggerValue,
  *          triggerWhere, triggerScan,                 // 触发条件(可选)
  *          watches: [ watch... ] }
  * watch: { module, offset, reg, expr, action, size, label } */

@@ -117,6 +117,25 @@ static void check_cmp(TrigMatch m, TrigWhere w, NSString *value,
            [value UTF8String], got ? "命中" : "不命中");
 }
 
+static void check_trigger_address(NSString *address, bool want,
+                                  uint64_t expected, const char *what) {
+    TraceSpec t;
+    memset(&t, 0, sizeof(t));
+    t.static_start = 0x1000;
+    t.static_end = 0x2000;
+    char err[160] = "";
+    NSMutableDictionary *it = [@{ @"triggerExpr": @"[x0]" } mutableCopy];
+    if (address != nil) it[@"triggerAddress"] = address;
+    bool got = load_trigger(it, &t, err, sizeof(err));
+    if (got != want || (got && t.trigger_address != expected)) {
+        printf("FAIL %s: got=%d address=0x%llx err=%s\n", what, got,
+               (unsigned long long)t.trigger_address, err);
+        g_fail++;
+        return;
+    }
+    printf("ok   %s%s\n", what, got ? "" : " (已拒绝)");
+}
+
 int main(void) {
     @autoreleasepool {
         puts("-- bytes:按内存顺序,和 hexdump 里看到的一致 --");
@@ -190,6 +209,16 @@ int main(void) {
             }
         }
         reject(@"bogus", @"x");            /* 未知匹配方式 */
+
+        puts("\n-- 自定义判断地址 --");
+        check_trigger_address(nil, true, 0x1000, "缺省 = start");
+        check_trigger_address(@"0x1000", true, 0x1000, "等于 start");
+        check_trigger_address(@"0xfe0", true, 0xfe0, "低于 start 且间隔足够");
+        check_trigger_address(@"0xff8", false, 0, "低于 start 但补丁重叠");
+        check_trigger_address(@"0x1800", false, 0, "落在 trace 区间内");
+        check_trigger_address(@"0x2000", true, 0x2000, "等于 end");
+        check_trigger_address(@"0x2400", true, 0x2400, "高于 end");
+        check_trigger_address(@"0x12zz", false, 0, "含非法字符");
         {
             TraceSpec t; char err[96] = "";
             memset(&t, 0, sizeof(t));

@@ -29,6 +29,8 @@ typedef struct {
 
 /* 自动 hook 每目标的运行时状态(次数用完透传) */
 extern void *g_origin[TRACE_MAX_TARGETS];
+/* 自定义触发地址的 Dobby origin；触发地址=起始地址时为 NULL。 */
+extern void *g_trigger_origin[TRACE_MAX_TARGETS];
 extern int g_remaining[TRACE_MAX_TARGETS];
 /* 装 hook 时算好的模块运行时基址。**别在命中时重新 find_module** ——
  * 那会遍历所有 dyld 镜像做 strstr 并抢 dyld 锁,热点上足以把整个进程拖死。 */
@@ -39,6 +41,10 @@ void qbdi_trace_init_state(void);
  * QBDI 只负责记录;rf 出入参都是 hook 点输入寄存器(输出状态丢弃)。
  * 返回续跑地址 = Dobby origin,让区域代码原生执行一遍,app 状态才正确。 */
 uint64_t trace_ctx_entry(TraceRegFile *rf, int idx);
+
+/* 自定义触发 hook 入口：只判断条件并授权同线程下一次 trace，
+ * 不在这个 hook 上直接启动 QBDI。返回值是该 hook 的 Dobby origin。 */
+uint64_t trigger_ctx_entry(TraceRegFile *rf, int idx);
 
 /* 手动区间 trace:从 模块基址+static_start 跑到 模块基址+static_end,返回停止时 x0。
  * 手动调用前可设 g_enter_args[8] 作参数;g_enter_origin 为 NULL 时从真实模块地址起跑。 */

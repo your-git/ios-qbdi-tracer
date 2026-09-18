@@ -17,3 +17,6 @@ NSString *ExprBaseReg(NSString *src);
  * 点确定 → onOK(表达式);取消 → 不回调。 */
 void ExprPrompt(UIViewController *host, NSString *initial,
                 void (^onOK)(NSString *expr));
+
+/* 给十六进制地址输入框附加快捷键盘：0X、0-9、A-F、删除/清空/完成。 */
+void AttachHexKeyboard(UITextField *field);

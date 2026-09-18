@@ -26,13 +26,13 @@
 | `entry.m` | 10 | `UIApplicationMain` |
 | `src/AppDelegate.m` | 17 | 建 window + 导航栈,root = RootListVC |
 | `src/ConfigStore.{h,m}` | ~290 | **JSON 读写**。`load`/`save`/`newItem` + **导出/导入**(`exportItem`/`listImportableFiles`/`importItemFromData`/`importItemFromString`/`exportDir`)。路径探测(rootless /var/jb)。**与引擎 schema 必须一致** |
-| `src/ExprInput.{h,m}` | ~250 | **取址表达式的输入与校验**,两个编辑页共用:`ExprSyntaxOK`/`ExprBaseReg`(轻量语法校验,**要与 `watch_expr.c` 的文法一致**)+ `ExprPrompt`(带寄存器/`[]`/`0x` 快捷栏、即时标红的输入弹窗) |
+| `src/ExprInput.{h,m}` | ~320 | **取址表达式的输入与校验**,两个编辑页共用:`ExprSyntaxOK`/`ExprBaseReg`(轻量语法校验,**要与 `watch_expr.c` 的文法一致**)+ `ExprPrompt`(表达式快捷栏)+ `AttachHexKeyboard`(地址输入的 `0X 0-9 A-F` 快捷栏) |
 | `src/HexValue.{h,m}` | ~50 | 「字节长度」类字段(watch 的 `size`、触发条件的 `triggerScan`)的进制处理:`HexValueFromJSON`(JSON 看前缀定进制)/ `HexParseInput`(输入框一律 hex)/ `HexDisplay`。**与引擎 `parse_size` 规则必须一致** |
 | `src/NavController.{h,m}` | ~50 | `UINavigationController` 子类,override `navigationBar:shouldPopItem:` 来**拦住系统返回按钮**(UIKit 没有公开的"即将 pop"回调;这依赖 UINavigationController 私下就是自己 navigationBar 的 delegate)。含 `NavPopGuard` 协议 |
 | `src/FormEditVC.{h,m}` | ~120 | 表单编辑页**基类**:快照 / 脏检查 / 「放弃修改?」确认；编辑页显示期间一律禁用右滑返回。TraceEditVC 和 WatchEditVC 都继承它 |
 | `src/RootListVC.m` | ~450 | 主界面。总开关 + 条目列表。点击=编辑,前缘滑=启停,尾缘滑=命名/导出/复制/删除。自定义名称存在时用三行展示，旧 JSON 仍用两行 |
 | `src/AppPickerVC.m` | 141 | 应用选择器。`LSApplicationWorkspace`(私有 API)列所有 app 图标+名字+bundleId,带搜索 |
-| `src/TraceEditVC.m` | ~680 | trace 表单。**5 段**:App信息/模块地址/选项/触发条件/watches子表(trace 次数和原来的 logMask 均已隐藏)。触发条件那段按匹配方式伸缩，并在启用时显示「改为无条件」按钮。「完成」里带 end-start ≥ 0x10、表达式语法、期望值格式、搜索窗口的校验 |
+| `src/TraceEditVC.m` | ~800 | trace 表单。**5 段**:App信息/模块地址/选项/触发条件/watches子表(trace 次数和原来的 logMask 均已隐藏)。触发条件支持可选 `triggerAddress`，按匹配方式伸缩，并在启用时显示「改为无条件」。「完成」里带区间、Hook 距离、表达式、期望值和搜索窗口校验 |
 | `src/WatchEditVC.m` | ~217 | watch 表单。寄存器/action 用 action sheet;寄存器那栏顶部的「✎ 输入取址表达式…」走 `ExprInput` 的弹窗;size 走 `HexValue` |
 | `src/ImportVC.m` | ~110 | **从文件导入**列表页。列 exportDir 里的 .json,点选 → 校验 → 加入 items |
 | `Resources/Info.plist` | - | **必须在 Resources/**,否则图标不出现。bundleId=`com.snk.qbditracer`。含 `UIFileSharingEnabled`+`LSSupportsOpeningDocumentsInPlace`(导出文件供 Finder 文件共享取出) |
@@ -91,6 +91,10 @@
    和 `trigger_hit`(负责读内存)、`trigger_log_miss`(诊断输出)
 4. `GUI/src/TraceEditVC.m` —— `TrigMatchKind`/`TrigWhereKind` 枚举、`triggerRows` 行映射、
    footer 文案、「完成」校验
+
+`triggerAddress` 是可选 item 字段:缺失/留空/等于 start 使用原 start Hook；其余地址使用
+`g_trigger_tramps` + `trigger_ctx_entry`。命中后用线程局部 bitmask 授权同线程下一次 start，
+不要改成全局 bool。字段还必须同步 `ConfigStore.m` 的导入白名单。
 
 改完跑 `./scripts/test_watch_expr.sh` 的第 4 组,它会验证解析结果和 `trig_compare` 的语义。
 
@@ -164,6 +168,7 @@
 22. **别用 UTF-8 在二进制里搜中文字符串来验证**:含非 ASCII 的 `@"中文"` NSString 字面量,clang 会编成 **UTF-16** 存进 `__ustring` 段(不是 UTF-8 的 `__cstring`)。用 UTF-8 搜会全部 "missing" —— 这是**误报**,不代表字符串没编进去。要搜就搜 UTF-16LE(`kw.encode('utf-16-le')`)。ASCII 字符串才在 `__cstring` 里。
 23. **启停只能在写入 JSON 成功后更新界面**:保存失败时要恢复内存中的 `enabled`，否则会出现“界面已停用，目标 App 重启后仍启用”。UI 和引擎对旧 JSON 缺失 `enabled` 的默认值都必须是 `true`，否则会显示为停用但引擎仍执行。引擎只在目标 App 启动时读一次配置，所以成功切换后仍必须重启目标 App。
 24. **`traceName` 是可选展示字段**:旧 JSON 没有时必须保持原来的两行展示；导入白名单必须保留它，复制/导出也必须带上。空白名称要删除 key，不要显示空的第一行。
+25. **自定义触发地址会多一个 Dobby Hook**:`triggerAddress` 不能在 `(start,end)` 内；低于 start 时必须至少相差 `0x10`。引擎还会拒绝同模块不同条目间重叠的 Dobby 补丁。数值在区间外不代表动态路径不会经过它；帮助里的 QBDI/Dobby 冲突提示不能删。
 
 ## 本机自测(不用设备、不用 theos)
 
@@ -304,6 +309,10 @@ GUI 校验与引擎 parser 的判断、size 两侧的进制解析都交叉比对
     诊断里的地址/内容必须随调用变化。若始终停在第一次，立即反汇编确认结尾是
     `mov x17, x0` → 恢复 x16 → `br x17`，且中间没有恢复覆盖 x17。
 41. **启停两种入口**:右滑到底自动执行、只露出按钮再点击，两者都应更新勾选并提示“重启目标 App 后生效”；重启后核对 JSON 与引擎行为一致。
+42. **自定义触发地址**:留空/等于 start 保持原行为；低于 start 且间隔≥0x10 可命中；等于/高于 end 命中后，同一线程下一次跳回 start 才 Trace。
+43. 判断地址在 `(start,end)` 内或低地址距 start <0x10 → GUI/引擎都拒绝；与另一条目 Hook 补丁重叠 → 引擎加载时拒绝。系统控制台应有 `[ios-qbdi-tracer]` 诊断。
+44. 用两个线程验证自定义触发:线程 A 命中 trigger 后，线程 B 先到 start 不能 Trace；只有 A 到 start 才能消费授权。
+45. 起始/结束/判断/监视地址输入框都有 `0X 0-9 A-F` 快捷键；非法字符即时标红，「完成」时再做权威校验。
 42. **启停保存失败**:在测试环境临时使配置目录不可写，操作后必须提示失败并恢复原勾选，不得出现假启用/假停用。
 43. **自定义名称**:左滑「命名」后显示三行；再次命名为空后恢复旧两行。名称同时出现在 hook 安装日志中。
 44. **名称兼容性**:旧 JSON 打开无空白行；命名后复制、导出再导入，`traceName` 都不丢失。

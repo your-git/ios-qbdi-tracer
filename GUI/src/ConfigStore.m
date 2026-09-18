@@ -101,6 +101,7 @@
         @"delaySecs": @0,
         @"logMask": @17,         /* LOG_INST | LOG_VREG(界面已不再让用户选) */
         @"maxInstructions": @0,  /* 0=精确跑到 end，不按指令数截断 */
+        @"triggerAddress": @"", /* 留空=起始地址；旧 JSON 缺失时同样处理 */
         @"watches": [NSMutableArray array],
     } mutableCopy];
 }
@@ -230,7 +231,8 @@ static NSString *sanitizeName(NSString *s) {
     for (NSString *k in @[ @"enabled", @"traceName", @"bundleId", @"appName", @"module",
                            @"start", @"end", @"count", @"moduleOnly",
                            @"delaySecs", @"logMask", @"maxInstructions",
-                           @"triggerExpr", @"triggerMatch", @"triggerValue",
+                           @"triggerExpr", @"triggerAddress",
+                           @"triggerMatch", @"triggerValue",
                            @"triggerWhere", @"triggerScan" ]) {
         if (item[k] != nil) out[k] = item[k];
     }

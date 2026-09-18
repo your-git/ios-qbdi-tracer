@@ -239,3 +239,73 @@ void ExprPrompt(UIViewController *host, NSString *initial,
     objc_setAssociatedObject(al, "exprCtl", ctl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [host presentViewController:al animated:YES completion:nil];
 }
+
+#pragma mark - 十六进制地址快捷键盘
+
+@interface HexKeyboardCtl : NSObject
+@property (nonatomic, weak) UITextField *field;
+@end
+
+@implementation HexKeyboardCtl
+- (void)tap:(UIButton *)button {
+    UITextField *field = self.field;
+    if (field == nil) return;
+    NSString *title = button.currentTitle;
+    if ([title isEqualToString:@"清空"]) {
+        field.text = @"";
+    } else if ([title isEqualToString:@"删除"]) {
+        [field deleteBackward];
+    } else if ([title isEqualToString:@"完成"]) {
+        [field resignFirstResponder];
+        return;
+    } else {
+        [field insertText:title];
+    }
+    [field sendActionsForControlEvents:UIControlEventEditingChanged];
+}
+@end
+
+void AttachHexKeyboard(UITextField *field) {
+    if (field == nil) return;
+    HexKeyboardCtl *ctl = [HexKeyboardCtl new];
+    ctl.field = field;
+
+    CGFloat width = [UIScreen mainScreen].bounds.size.width;
+    UIScrollView *bar =
+        [[UIScrollView alloc] initWithFrame:CGRectMake(0, 0, width, 44)];
+    bar.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    bar.showsHorizontalScrollIndicator = NO;
+    bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+
+    NSArray<NSString *> *titles = @[
+        @"0X", @"0", @"1", @"2", @"3", @"4", @"5", @"6", @"7", @"8", @"9",
+        @"A", @"B", @"C", @"D", @"E", @"F", @"删除", @"清空", @"完成"
+    ];
+    UIFont *font = [UIFont monospacedSystemFontOfSize:15
+                                               weight:UIFontWeightMedium];
+    CGFloat x = 8;
+    for (NSString *title in titles) {
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        [button setTitle:title forState:UIControlStateNormal];
+        button.titleLabel.font = font;
+        CGFloat buttonWidth =
+            [title sizeWithAttributes:@{ NSFontAttributeName: font }].width + 20;
+        if (buttonWidth < 36) buttonWidth = 36;
+        button.frame = CGRectMake(x, 5, buttonWidth, 34);
+        button.backgroundColor = [UIColor tertiarySystemBackgroundColor];
+        button.layer.cornerRadius = 6;
+        [button addTarget:ctl action:@selector(tap:)
+          forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:button];
+        x += buttonWidth + 6;
+    }
+    bar.contentSize = CGSizeMake(x + 2, 44);
+    field.inputAccessoryView = bar;
+    field.keyboardType = UIKeyboardTypeASCIICapable;
+    field.autocorrectionType = UITextAutocorrectionTypeNo;
+    field.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+    field.spellCheckingType = UITextSpellCheckingTypeNo;
+    /* target 必须和输入框同寿命，否则 accessory 按钮会变成悬空 target。 */
+    objc_setAssociatedObject(field, "hexKeyboardCtl", ctl,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}

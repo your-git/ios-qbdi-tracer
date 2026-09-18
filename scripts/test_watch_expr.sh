@@ -50,7 +50,7 @@ clang -fobjc-arc $CFLAGS -I"$OUT" -framework Foundation \
 
 echo
 echo "=== 4/4 触发条件期望值解析 ==="
-# load_trigger 依赖 engine.m 里的 parse_hex / parse_size / dup_str,一起提取。
+# load_trigger 依赖 engine.m 里的 hex/size 解析和 dup_str,一起提取。
 # 用 index() 做字面量前缀匹配 —— 函数签名里有 '*',当正则会被当量词。
 extract_fn() {
   awk -v sig="$1" 'index($0, sig) == 1 {f=1} f{print} f && /^\}$/{exit}' \
@@ -59,6 +59,7 @@ extract_fn() {
 }
 {
   extract_fn 'static uint64_t parse_hex'
+  extract_fn 'static bool parse_hex_strict'
   extract_fn 'static uint64_t parse_size'
   extract_fn 'static const char *dup_str'
   extract_fn 'static bool load_trigger'

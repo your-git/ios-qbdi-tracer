@@ -130,14 +130,24 @@ origin trampoline —— QBDI 执行的是那份副本,副本地址永远不等�
 
 所以 trace 条目可以带一个**触发条件**:
 
+`triggerAddress` 缺失/留空/等于 `static_start` 时沿用原流程:
+
 ```
-hook 命中 → 求值 triggerExpr(用 hook 点的输入寄存器) → 匹配?
-    不匹配 → 计数 +1,直接 return origin(不写日志、不减 count、不启动 QBDI)
+start hook 命中 → 求值 triggerExpr(用 start 的输入寄存器) → 匹配?
+    不匹配 → 计数 +1,直接 return origin(不减 count、不启动 QBDI)
     匹配   → 照常 run_trace
 ```
 
-判断点在 `trace_ctx_entry` 里、`g_remaining[idx]` 递减**之前** —— 这是关键:
-那一刻一行日志都还没写、次数也没动,所以"不匹配"可以做到完全没有副作用。
+自定义 `triggerAddress` 时另装一个 Dobby Hook:
+
+```
+trigger hook 命中并匹配 → 授权同一线程的下一次 start
+start hook 命中且有授权 → 消费授权 → run_trace
+```
+
+授权用 TLS bitmask 隔离,防止 A 线程命中条件却让 B 线程开始 Trace。高于结束地址的
+触发点因此可以授权程序之后跳回低地址的下一轮 Trace。所有判断都在
+`g_remaining[idx]` 递减之前,不匹配不浪费 Trace 次数。
 
 四种匹配方式(`TrigMatch`)× 两种位置(`TrigWhere`),都在 `config.h`:
 
@@ -170,9 +180,11 @@ hook 命中 → 求值 triggerExpr(用 hook 点的输入寄存器) → 匹配?
 `vm_read_overwrite` 有个坑:读取范围末尾一旦跨到未映射页,**整块调用失败返回 0**。
 所以 `trigger_read()` 在整块失败时退一步、只读到本页末尾 —— 否则窗口设大一点就什么都读不到。
 
-**限制**:条件只能用 hook 点(`static_start`)的寄存器状态。`TraceRegFile` 里没有 pc,
-表达式里写 `pc` 会得到 hook 点地址。如果需要"区间中间某条指令时的状态"才能判断,
-得改成边 trace 边缓冲日志、判断点之后再决定 flush/丢弃 —— 复杂度高一档,暂未做。
+**地址限制**:自定义判断地址不得落在 `(static_start, static_end)` 中。低于 start 时
+与 start 至少差 `QBDI_PATCH_SIZE = 0x10`,避免两个 Dobby 补丁重叠。等于 end 或高于
+end 可用。表达式的 `pc` 是实际判断 Hook 地址。数值上在区间外也不能完全证明安全:
+QBDI 跟随的是动态控制流,如果 Trace 的调用路径又执行了外部 trigger Hook，Dobby 补丁仍可能影响
+QBDI。引擎会阻止这种情况下的嵌套授权,但配置时仍应选不会在 Trace 动态路径里再次执行的点。
 
 **条件配错时拒绝整条 trace**(而不是退化成无条件):过滤静默失效会给出一堆本该被滤掉的
 日志,而用户以为条件在生效,比不 trace 更误导。
@@ -248,6 +260,7 @@ after N filtered calls`。
                                       // (INST|VREG);引擎照旧按字段值跑,旧配置不受影响
       "maxInstructions": 0,           // 可选;0/缺省=跑到 end,非 0=达上限时截断
       "triggerExpr": "[x2+0x10]",     // 触发条件:留空/缺失 = 无条件(默认)
+      "triggerAddress": "0x27A1F400", // 可选;缺失/留空=start,否则必须在 trace 区间外
       "triggerMatch": "bytes",        // notnull | bytes | cstr | u64
       "triggerValue": "08a48c90",     // bytes 按内存顺序;u64 是小端整数;notnull 不用填
       "triggerWhere": "prefix",       // prefix | contains(缺省:cstr=contains,bytes=prefix)

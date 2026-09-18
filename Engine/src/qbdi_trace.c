@@ -42,8 +42,16 @@ __thread void *g_enter_origin;
 
 /* 自动 hook 每目标的运行时状态 */
 void *g_origin[TRACE_MAX_TARGETS];
+void *g_trigger_origin[TRACE_MAX_TARGETS];
 int g_remaining[TRACE_MAX_TARGETS];
 uint64_t g_module_base[TRACE_MAX_TARGETS];
+
+/* 自定义触发只授权“同一线程的下一次 start”，绝不能用全局布尔值，
+ * 否则 A 线程命中会错误触发 B 线程。32 个槽位正好用一个 bitmask。 */
+static __thread uint32_t g_trigger_armed_mask;
+/* QBDI 动态路径可能又走到外部触发 hook；此时只透传，不能反过来授权
+ * 嵌套 trace。这是重入保护，不代表可以忽略 Hook 地址选择。 */
+static __thread unsigned int g_inside_qbdi_trace;
 
 typedef struct {
     const char *module;
@@ -748,6 +756,21 @@ static void trigger_log_miss(const TraceSpec *spec, const TrigProbe *probe,
     pthread_mutex_unlock(&g_trace_lock);
 }
 
+/* 外部触发 hook 和 start hook 共用同一套指数退避诊断。 */
+static void trigger_record_miss(const TraceSpec *spec, int idx,
+                                const TrigProbe *probe,
+                                const TraceRegFile *rf) {
+    uint64_t n = __atomic_add_fetch(&g_filtered[idx], 1, __ATOMIC_RELAXED);
+    uint64_t next = __atomic_load_n(&g_trig_next_log[idx], __ATOMIC_RELAXED);
+    if (next == 0) next = 1;
+    if (n < next) return;
+    if (__atomic_compare_exchange_n(&g_trig_next_log[idx], &next, next * 10,
+                                    false, __ATOMIC_RELAXED,
+                                    __ATOMIC_RELAXED)) {
+        trigger_log_miss(spec, probe, n, rf);
+    }
+}
+
 /* 指令级回调:PREINST,每条指令执行前触发 */
 static VMAction inst_cb(VMInstanceRef vm, GPRState *gpr, FPRState *fpr,
                         void *data) {
@@ -939,8 +962,11 @@ void qbdi_trace_crash_diag_init(void) {
 }
 
 void qbdi_trace_init_state(void) {
+    g_trigger_armed_mask = 0;
+    g_inside_qbdi_trace = 0;
     for (int i = 0; i < g_trace_count && i < TRACE_MAX_TARGETS; i++) {
         g_origin[i] = NULL;
+        g_trigger_origin[i] = NULL;
         g_module_base[i] = 0;
         g_remaining[i] = g_traces[i].count;
         g_filtered[i] = 0;
@@ -1051,7 +1077,9 @@ static uint64_t run_trace(const TraceSpec *spec, uint64_t base, void *origin,
     }
 
     qbdi_trace_logf("[%s] trace#%d step: qbdi_run\n", spec->module, no);
+    g_inside_qbdi_trace++;
     bool ok = qbdi_run(vm, entry, end);
+    g_inside_qbdi_trace--;
 
     /* 回写输出寄存器(除 sp:真实 sp 保留);LR 若在 origin 洞里则映射回模块地址 */
     memcpy(rf->x, state, 29 * sizeof(uint64_t));
@@ -1143,29 +1171,21 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx) {
         return (uint64_t)(uintptr_t)origin;
     }
 
-    /* 触发条件:在这里判断 —— 此刻一行日志都还没写、count 也还没减。
-     * 不匹配就直接透传,这次调用当没发生过(日志干净,次数不浪费)。 */
+    /* 默认地址在 start 当场判断；自定义地址则只消费本线程之前的授权。 */
     if (spec->trigger_match != TRIG_NONE) {
-        TrigProbe probe;
-        if (!trigger_hit(spec, rf, base + spec->static_start, &probe)) {
-            /* 同一个 hook 点会被多个线程同时命中,计数必须是原子的 */
-            uint64_t n = __atomic_add_fetch(&g_filtered[idx], 1, __ATOMIC_RELAXED);
-            /* 指数退避打诊断:第 1/10/100/1000... 次各打一次完整信息。
-             * 热点上可能有几千万次调用,每次都写日志会把文件写爆。 */
-            uint64_t next = __atomic_load_n(&g_trig_next_log[idx], __ATOMIC_RELAXED);
-            if (next == 0) {
-                next = 1;
+        if (spec->trigger_address == spec->static_start) {
+            TrigProbe probe;
+            if (!trigger_hit(spec, rf, base + spec->static_start, &probe)) {
+                trigger_record_miss(spec, idx, &probe, rf);
+                return (uint64_t)(uintptr_t)origin;
             }
-            if (n >= next) {
-                /* 抢到"这次该我打"的那个线程才打,别的线程跳过 */
-                if (__atomic_compare_exchange_n(&g_trig_next_log[idx], &next,
-                                                next * 10, false,
-                                                __ATOMIC_RELAXED,
-                                                __ATOMIC_RELAXED)) {
-                    trigger_log_miss(spec, &probe, n, rf);
-                }
+        } else {
+            uint32_t bit = (uint32_t)1u << (unsigned int)idx;
+            if ((g_trigger_armed_mask & bit) == 0) {
+                return (uint64_t)(uintptr_t)origin;
             }
-            return (uint64_t)(uintptr_t)origin;
+            /* 一次性授权：在占用 trace 次数前就消费，防止重入 start 复用。 */
+            g_trigger_armed_mask &= ~bit;
         }
     }
 
@@ -1177,12 +1197,21 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx) {
     }
 
     if (spec->trigger_match != TRIG_NONE) {
-        qbdi_trace_logf("[%s] trigger matched (%s %s) after %llu filtered calls\n",
-                        spec->module, trig_match_name(spec->trigger_match),
-                        spec->trigger_where == TRIG_AT_CONTAINS ? "contains"
-                                                                : "prefix",
-                        (unsigned long long)__atomic_load_n(&g_filtered[idx],
-                                                            __ATOMIC_RELAXED));
+        if (spec->trigger_address == spec->static_start) {
+            qbdi_trace_logf(
+                "[%s] trigger matched (%s %s) after %llu filtered calls\n",
+                spec->module, trig_match_name(spec->trigger_match),
+                spec->trigger_where == TRIG_AT_CONTAINS ? "contains"
+                                                        : "prefix",
+                (unsigned long long)__atomic_load_n(&g_filtered[idx],
+                                                    __ATOMIC_RELAXED));
+        } else {
+            qbdi_trace_logf(
+                "[%s] trigger authorization consumed at start 0x%llx "
+                "(thread=%p)\n",
+                spec->module, (unsigned long long)spec->static_start,
+                (void *)pthread_self());
+        }
     }
     /* QBDI 在虚拟栈上只做「记录」;输出寄存器丢弃,恢复 hook 点输入寄存器,
      * 然后跳回 origin 让区域代码原生执行一遍,保证 app 状态正确。
@@ -1194,6 +1223,58 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx) {
     }
 
     /* 续跑地址 = origin:跑原区域的搬迁代码,再跳回 start+PATCH_SIZE 继续原函数 */
+    return (uint64_t)(uintptr_t)origin;
+}
+
+uint64_t trigger_ctx_entry(TraceRegFile *rf, int idx) {
+    void *origin = idx >= 0 && idx < TRACE_MAX_TARGETS
+                       ? g_trigger_origin[idx]
+                       : NULL;
+    if (idx < 0 || idx >= g_trace_count || rf == NULL) {
+        qbdi_trace_logf(
+            "[engine] trigger return failed: invalid slot %d "
+            "(trace count %d, origin=%p)\n",
+            idx, g_trace_count, origin);
+        return origin != NULL ? (uint64_t)(uintptr_t)origin
+                              : (rf != NULL ? rf->lr : 0);
+    }
+    const TraceSpec *spec = &g_traces[idx];
+    uint64_t base = g_module_base[idx];
+    if (origin == NULL || spec->module == NULL || base == 0) {
+        qbdi_trace_logf(
+            "[engine] trigger return fallback: slot %d module=%s base=0x%llx "
+            "origin=%p\n",
+            idx, spec->module ? spec->module : "(null)",
+            (unsigned long long)base, origin);
+        return origin != NULL
+                   ? (uint64_t)(uintptr_t)origin
+                   : base + spec->trigger_address + QBDI_PATCH_SIZE;
+    }
+    /* QBDI 动态路径再命中这个 Dobby hook 时只透传，避免嵌套授权。 */
+    if (g_origin[idx] == NULL || g_inside_qbdi_trace != 0 ||
+        __atomic_load_n(&g_remaining[idx], __ATOMIC_RELAXED) <= 0) {
+        return (uint64_t)(uintptr_t)origin;
+    }
+
+    TrigProbe probe;
+    if (!trigger_hit(spec, rf, base + spec->trigger_address, &probe)) {
+        trigger_record_miss(spec, idx, &probe, rf);
+        return (uint64_t)(uintptr_t)origin;
+    }
+
+    uint32_t bit = (uint32_t)1u << (unsigned int)idx;
+    bool was_armed = (g_trigger_armed_mask & bit) != 0;
+    g_trigger_armed_mask |= bit;
+    if (!was_armed) {
+        uint64_t filtered =
+            __atomic_load_n(&g_filtered[idx], __ATOMIC_RELAXED);
+        qbdi_trace_logf(
+            "[%s] trigger matched at 0x%llx; armed next start 0x%llx "
+            "on thread=%p after %llu filtered calls\n",
+            spec->module, (unsigned long long)spec->trigger_address,
+            (unsigned long long)spec->static_start, (void *)pthread_self(),
+            (unsigned long long)filtered);
+    }
     return (uint64_t)(uintptr_t)origin;
 }
 

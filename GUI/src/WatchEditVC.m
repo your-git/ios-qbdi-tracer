@@ -40,6 +40,7 @@ static NSArray *ActionNames(void) {
 
 @interface WatchEditVC () <UITextFieldDelegate>
 @property (nonatomic, strong) NSMutableDictionary *watch;
+- (void)hexAddressChanged:(UITextField *)field;
 @end
 
 @implementation WatchEditVC
@@ -129,12 +130,31 @@ static NSArray *ActionNames(void) {
                                       ? [v stringValue] : @"");
     }
     objc_setAssociatedObject(c.field, "k", key, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if ([key isEqualToString:@"offset"]) {
+        AttachHexKeyboard(c.field);
+        [c.field addTarget:self action:@selector(hexAddressChanged:)
+          forControlEvents:UIControlEventEditingChanged];
+    }
     return c;
 }
 
 - (void)textFieldDidEndEditing:(UITextField *)tf {
     NSString *k = objc_getAssociatedObject(tf, "k");
     if (k.length == 0) return;
+    if ([k isEqualToString:@"offset"]) {
+        NSString *text = [tf.text stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        unsigned long long n = 0;
+        if (text.length > 0 && HexParseInput(text, &n)) {
+            NSString *normalized = [NSString stringWithFormat:@"0x%llx", n];
+            self.watch[k] = normalized;
+            tf.text = normalized;
+        } else {
+            self.watch[k] = text ?: @"";
+        }
+        [self hexAddressChanged:tf];
+        return;
+    }
     if ([k isEqualToString:@"size"]) {
         unsigned long long n = 0;
         if (HexParseInput(tf.text, &n)) {
@@ -147,6 +167,16 @@ static NSArray *ActionNames(void) {
         return;
     }
     self.watch[k] = tf.text ?: @"";
+    [self updatePopGesture];
+}
+
+- (void)hexAddressChanged:(UITextField *)field {
+    NSString *text = [field.text stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    unsigned long long value = 0;
+    BOOL valid = text.length > 0 && HexParseInput(text, &value);
+    self.watch[@"offset"] = text ?: @"";
+    field.textColor = valid ? [UIColor labelColor] : [UIColor systemRedColor];
     [self updatePopGesture];
 }
 - (BOOL)textFieldShouldReturn:(UITextField *)tf { [tf resignFirstResponder]; return YES; }
@@ -209,6 +239,19 @@ static NSArray *ActionNames(void) {
 
 - (void)commit {
     [self.view endEditing:YES];
+    NSString *offset = [self.watch[@"offset"] description];
+    unsigned long long ignored = 0;
+    if (offset.length == 0 || !HexParseInput(offset, &ignored)) {
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"监视地址无效"
+                             message:@"监视地址只能包含 0X、0-9 和 A-F。"
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
     if (self.onDone) self.onDone();
     [self.navigationController popViewControllerAnimated:YES];
 }
