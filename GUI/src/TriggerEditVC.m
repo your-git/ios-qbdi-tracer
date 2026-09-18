@@ -8,6 +8,15 @@
 #define TRIGGER_SCAN_DEFAULT 0x100
 #define TRIGGER_SCAN_MAX 0x1000
 
+static BOOL TriggerLimitTextValid(NSString *text, NSInteger *value) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return NO;
+    NSCharacterSet *bad = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    if ([text rangeOfCharacterFromSet:bad].location != NSNotFound) return NO;
+    NSInteger n = text.integerValue;
+    if (value) *value = n;
+    return n >= 1 && n <= 16;
+}
+
 @interface TriggerFieldCell : UITableViewCell
 @property(nonatomic, strong) UITextField *field;
 @end
@@ -38,7 +47,7 @@ typedef NS_ENUM(NSInteger, TriggerMatch) {
 };
 typedef NS_ENUM(NSInteger, TriggerWhere) { TriggerWherePrefix, TriggerWhereContains };
 typedef NS_ENUM(NSInteger, TriggerRow) {
-    TriggerRowExpr, TriggerRowAddress, TriggerRowMatch, TriggerRowWhere,
+    TriggerRowExpr, TriggerRowAddress, TriggerRowLimit, TriggerRowMatch, TriggerRowWhere,
     TriggerRowValue, TriggerRowScan,
 };
 
@@ -46,18 +55,21 @@ typedef NS_ENUM(NSInteger, TriggerRow) {
 @property(nonatomic, strong) NSMutableDictionary *trigger;
 @property(nonatomic, assign) unsigned long long start;
 @property(nonatomic, assign) unsigned long long end;
+@property(nonatomic, assign) BOOL customLimit;
 @end
 
 @implementation TriggerEditVC
 
 - (instancetype)initWithTrigger:(NSMutableDictionary *)trigger
                            start:(unsigned long long)start
-                             end:(unsigned long long)end {
+                             end:(unsigned long long)end
+                     customLimit:(BOOL)customLimit {
     self = [super initWithStyle:UITableViewStyleInsetGrouped];
     if (self) {
         _trigger = trigger;
         _start = start;
         _end = end;
+        _customLimit = customLimit;
     }
     return self;
 }
@@ -70,6 +82,7 @@ typedef NS_ENUM(NSInteger, TriggerRow) {
         initWithTitle:@"确定" style:UIBarButtonItemStyleDone
                target:self action:@selector(done)];
     if (self.trigger[@"triggerMatch"] == nil) self.trigger[@"triggerMatch"] = @"notnull";
+    if (self.trigger[@"triggerLimit"] == nil) self.trigger[@"triggerLimit"] = @1;
     id address = self.trigger[@"triggerAddress"];
     if ([address isKindOfClass:[NSNumber class]]) {
         self.trigger[@"triggerAddress"] = [NSString stringWithFormat:@"0x%llx",
@@ -100,18 +113,20 @@ typedef NS_ENUM(NSInteger, TriggerRow) {
 
 - (NSArray<NSNumber *> *)rows {
     TriggerMatch m = [self match];
+    NSMutableArray *rows = [@[ @(TriggerRowExpr), @(TriggerRowAddress) ] mutableCopy];
+    if (self.customLimit) [rows addObject:@(TriggerRowLimit)];
+    [rows addObject:@(TriggerRowMatch)];
     if (m == TriggerMatchNotNull) {
-        return @[ @(TriggerRowExpr), @(TriggerRowAddress), @(TriggerRowMatch) ];
+        return rows;
     }
     if (m == TriggerMatchU64) {
-        return @[ @(TriggerRowExpr), @(TriggerRowAddress), @(TriggerRowMatch),
-                  @(TriggerRowValue) ];
+        [rows addObject:@(TriggerRowValue)];
+        return rows;
     }
-    NSMutableArray *r = [@[ @(TriggerRowExpr), @(TriggerRowAddress),
-                              @(TriggerRowMatch), @(TriggerRowWhere),
-                              @(TriggerRowValue) ] mutableCopy];
-    if ([self where] == TriggerWhereContains) [r addObject:@(TriggerRowScan)];
-    return r;
+    [rows addObject:@(TriggerRowWhere)];
+    [rows addObject:@(TriggerRowValue)];
+    if ([self where] == TriggerWhereContains) [rows addObject:@(TriggerRowScan)];
+    return rows;
 }
 
 - (NSString *)matchLabel {
@@ -143,7 +158,11 @@ typedef NS_ENUM(NSInteger, TriggerRow) {
     id v = self.trigger[key];
     c.field.text = [v isKindOfClass:[NSString class]] ? v : [v description];
     objc_setAssociatedObject(c.field, "triggerKey", key, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if ([key isEqualToString:@"triggerAddress"] || [key isEqualToString:@"triggerScan"]) {
+    if ([key isEqualToString:@"triggerLimit"]) {
+        c.field.keyboardType = UIKeyboardTypeNumberPad;
+        [c.field addTarget:self action:@selector(triggerFieldChanged:)
+          forControlEvents:UIControlEventEditingChanged];
+    } else if ([key isEqualToString:@"triggerAddress"] || [key isEqualToString:@"triggerScan"]) {
         AttachHexKeyboard(c.field);
         [c.field addTarget:self action:@selector(triggerFieldChanged:)
           forControlEvents:UIControlEventEditingChanged];
@@ -155,6 +174,9 @@ typedef NS_ENUM(NSInteger, TriggerRow) {
     TriggerRow row = (TriggerRow)[[self rows][ip.row] integerValue];
     if (row == TriggerRowAddress) {
         return [self field:@"triggerAddress" label:@"判断地址" placeholder:@"默认：起始地址"];
+    }
+    if (row == TriggerRowLimit) {
+        return [self field:@"triggerLimit" label:@"触发次数上限" placeholder:@"1–16"];
     }
     if (row == TriggerRowValue) {
         NSString *ph = [self match] == TriggerMatchBytes ? @"08a48c90" :
@@ -226,7 +248,11 @@ typedef NS_ENUM(NSInteger, TriggerRow) {
         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
     unsigned long long value = 0;
     BOOL valid = NO;
-    if ([key isEqualToString:@"triggerAddress"] && text.length == 0) {
+    if ([key isEqualToString:@"triggerLimit"]) {
+        NSInteger limit = 0;
+        valid = TriggerLimitTextValid(text, &limit);
+        self.trigger[key] = valid ? @(limit) : (text ?: @"");
+    } else if ([key isEqualToString:@"triggerAddress"] && text.length == 0) {
         valid = YES;
         [self.trigger removeObjectForKey:key];
     } else if (HexParseInput(text, &value)) {
@@ -251,7 +277,11 @@ typedef NS_ENUM(NSInteger, TriggerRow) {
     if (key == nil) return;
     NSString *text = [field.text stringByTrimmingCharactersInSet:
         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if ([key isEqualToString:@"triggerAddress"]) {
+    if ([key isEqualToString:@"triggerLimit"]) {
+        NSInteger limit = 0;
+        self.trigger[key] = TriggerLimitTextValid(text, &limit) ? @(limit)
+                                                                : (text ?: @"");
+    } else if ([key isEqualToString:@"triggerAddress"]) {
         if (text.length == 0) {
             [self.trigger removeObjectForKey:key];
         } else {
@@ -286,6 +316,11 @@ typedef NS_ENUM(NSInteger, TriggerRow) {
 
 - (void)done {
     [self.view endEditing:YES];
+    if (self.customLimit &&
+        !TriggerLimitTextValid([self.trigger[@"triggerLimit"] description], NULL)) {
+        [self alert:@"触发次数上限无效" message:@"触发次数上限必须是 1–16 的整数。"];
+        return;
+    }
     NSString *expr = self.trigger[@"triggerExpr"];
     if (!ExprSyntaxOK(expr)) {
         [self alert:@"触发条件无效" message:@"请填写有效的取址表达式。"];

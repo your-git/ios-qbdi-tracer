@@ -435,6 +435,7 @@ static BOOL traceEnabled(NSDictionary *item) {
     NSString *message =
         @"1. 可以添加任意数量的触发条件。没有条件时为无条件 Trace；有多条时，"
         @"满足其中任意一条即可。Trace 次数必须是 1–16。\n\n"
+        @"自定义消耗策略下，每条触发条件还可以设置 1–16 次的独立触发上限，默认 1 次。\n\n"
         @"2. 第一条条件的判断地址默认使用 Trace 起始地址。继续添加时，会自动带入"
         @"第一条的判断地址和取址表达式，仍可自行修改。\n\n"
         @"3. 自定义判断地址可以低于起始地址，也可以等于或高于结束地址；"
@@ -463,7 +464,13 @@ static BOOL traceEnabled(NSDictionary *item) {
         @"到达结束地址，该条件不会被消耗，可以继续重试。若一次 Trace 同时由多条条件"
         @"满足，这些条件会一起被消耗。重启目标 App 后状态重置。\n\n"
         @"可重复：条件不会被消耗。每次满足任意一条条件，都可以继续触发 Trace，直到"
-        @"达到设置的 Trace 次数。自定义地址的匹配只授权同一线程下一次到达起始地址。";
+        @"达到设置的 Trace 次数。\n\n"
+        @"自定义：在每条触发条件的编辑页面分别设置“触发次数上限”，范围是 1–16，"
+        @"默认 1。某条条件达到自己的上限后只停用该条件，其他条件仍可继续触发。"
+        @"一次 Trace 如果同时由多条条件授权，这些条件都会各记 1 次。"
+        @"只有成功到达结束地址才会计数；失败会释放本次额度。无论各条件上限合计多少，"
+        @"最终仍受 Trace 总次数限制。\n\n"
+        @"自定义地址的匹配只授权同一线程下一次到达起始地址。";
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"触发策略" message:message
                   preferredStyle:UIAlertControllerStyleAlert];

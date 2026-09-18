@@ -20,6 +20,7 @@ static bool test_load_trigger(NSDictionary *it, TraceTrigger *trigger,
 
 /* 纯比较逻辑,从 qbdi_trace.c 原样提取 */
 #include "trig_compare.inc"
+#include "trigger_consume.inc"
 
 static int g_fail = 0;
 
@@ -218,6 +219,62 @@ int main(void) {
             }
         }
         reject(@"bogus", @"x");            /* 未知匹配方式 */
+
+        puts("\n-- 每条条件的自定义触发次数上限 --");
+        {
+            TraceTrigger t; memset(&t, 0, sizeof(t)); char err[96] = "";
+            if (load_trigger(@{ @"triggerExpr": @"[x0]", @"triggerLimit": @16 },
+                             &t, err, sizeof(err)) && t.max_traces == 16) {
+                puts("ok   triggerLimit=16");
+            } else {
+                printf("FAIL triggerLimit=16:%s\n", err);
+                g_fail++;
+            }
+        }
+        for (NSNumber *bad in @[ @0, @17 ]) {
+            TraceTrigger t; memset(&t, 0, sizeof(t)); char err[96] = "";
+            if (!load_trigger(@{ @"triggerExpr": @"[x0]", @"triggerLimit": bad },
+                              &t, err, sizeof(err))) {
+                printf("ok   拒绝 triggerLimit=%d:%s\n", bad.intValue, err);
+            } else {
+                printf("FAIL triggerLimit=%d 应当被拒\n", bad.intValue);
+                g_fail++;
+            }
+        }
+        {
+            TraceSpec spec; memset(&spec, 0, sizeof(spec));
+            TraceTrigger tr; memset(&tr, 0, sizeof(tr));
+            spec.trigger_policy = TRIG_CONSUME_CUSTOM;
+            tr.max_traces = 2;
+            bool r1 = trigger_reserve(&spec, &tr);
+            bool r2 = trigger_reserve(&spec, &tr);
+            bool r3 = trigger_reserve(&spec, &tr);
+            uint32_t u1 = trigger_finish(&tr, true);
+            uint32_t u2 = trigger_finish(&tr, true);
+            if (r1 && r2 && !r3 && u1 == 1 && u2 == 2 &&
+                trigger_exhausted(&spec, &tr)) {
+                puts("ok   custom 并发预占不会超过两次上限");
+            } else {
+                puts("FAIL custom 并发预占或次数状态不正确");
+                g_fail++;
+            }
+        }
+        {
+            TraceSpec spec; memset(&spec, 0, sizeof(spec));
+            TraceTrigger tr; memset(&tr, 0, sizeof(tr));
+            spec.trigger_policy = TRIG_CONSUME_CUSTOM;
+            tr.max_traces = 1;
+            bool reserved = trigger_reserve(&spec, &tr);
+            uint32_t used = trigger_finish(&tr, false);
+            bool retry = trigger_reserve(&spec, &tr);
+            trigger_finish(&tr, true);
+            if (reserved && retry && used == 0 && trigger_exhausted(&spec, &tr)) {
+                puts("ok   失败释放预占，下一次仍可重试");
+            } else {
+                puts("FAIL 失败后没有正确释放预占");
+                g_fail++;
+            }
+        }
 
         puts("\n-- 自定义判断地址 --");
         check_trigger_address(nil, true, 0x1000, "缺省 = start");

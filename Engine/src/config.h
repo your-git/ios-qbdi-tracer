@@ -21,6 +21,12 @@ typedef enum {
     TRIG_AT_CONTAINS,   /* 包含:读最多 scan 字节(cstr 读到 \0),在里面搜 */
 } TrigWhere;
 
+typedef enum {
+    TRIG_CONSUME_REPEAT = 0,
+    TRIG_CONSUME_ONCE,
+    TRIG_CONSUME_CUSTOM,
+} TrigConsumePolicy;
+
 #define TRIG_MAX_BYTES 32     /* 期望值最长 32 字节 */
 #define TRIG_MAX_SCAN  0x1000 /* 「包含」的搜索窗口硬上限 4KB */
 #define TRIG_DEF_SCAN  0x100  /* 默认窗口 256 字节 */
@@ -36,7 +42,8 @@ typedef struct {
     uint8_t     want_bytes[TRIG_MAX_BYTES];
     int         want_nbytes;
     uint64_t    want_u64;
-    int         consume_state;                  /* 原子状态:0 可用,1 占用中,2 已消耗 */
+    int         max_traces;                     /* custom 策略下允许成功触发 1..16 次 */
+    uint32_t    consume_state;                  /* 原子状态:低16位成功数,高16位预占数 */
     uint64_t    filtered;                       /* 不匹配次数(指数退避日志) */
     uint64_t    next_log;
 } TraceTrigger;
@@ -55,7 +62,7 @@ typedef struct {
 
     TraceTrigger *triggers;                      /* 0 条 = 无条件 */
     int           trigger_count;                 /* 条件数量不设产品层上限 */
-    int           trigger_once;                  /* 1=成功后各条件只生效一次 */
+    TrigConsumePolicy trigger_policy;
 } TraceSpec;
 
 typedef struct {

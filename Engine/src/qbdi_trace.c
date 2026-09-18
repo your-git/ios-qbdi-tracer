@@ -992,6 +992,57 @@ static ThreadTriggerState *thread_trigger_state(int trace_idx) {
     return s;
 }
 
+#define TRIGGER_SUCCESS_MASK 0x0000ffffu
+#define TRIGGER_RESERVE_ONE  0x00010000u
+
+static int trigger_success_limit(const TraceSpec *spec,
+                                 const TraceTrigger *trigger) {
+    if (spec->trigger_policy == TRIG_CONSUME_ONCE) return 1;
+    if (spec->trigger_policy == TRIG_CONSUME_CUSTOM) return trigger->max_traces;
+    return 0; /* repeat:无限制 */
+}
+
+static bool trigger_exhausted(const TraceSpec *spec,
+                              const TraceTrigger *trigger) {
+    int limit = trigger_success_limit(spec, trigger);
+    if (limit == 0) return false;
+    uint32_t state = __atomic_load_n(&trigger->consume_state, __ATOMIC_ACQUIRE);
+    return (int)(state & TRIGGER_SUCCESS_MASK) >= limit;
+}
+
+/* 原子预占一次额度。高 16 位记录正在执行的 Trace，避免多个线程同时越过上限。 */
+static bool trigger_reserve(const TraceSpec *spec, TraceTrigger *trigger) {
+    int limit = trigger_success_limit(spec, trigger);
+    if (limit == 0) return true;
+    uint32_t old = __atomic_load_n(&trigger->consume_state, __ATOMIC_ACQUIRE);
+    for (;;) {
+        uint32_t successes = old & TRIGGER_SUCCESS_MASK;
+        uint32_t reserved = old >> 16;
+        if (successes + reserved >= (uint32_t)limit) return false;
+        uint32_t desired = old + TRIGGER_RESERVE_ONE;
+        if (__atomic_compare_exchange_n(&trigger->consume_state, &old, desired,
+                                        false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            return true;
+        }
+    }
+}
+
+/* 成功:预占转成成功次数；失败:只释放预占。 */
+static uint32_t trigger_finish(TraceTrigger *trigger, bool success) {
+    uint32_t old = __atomic_load_n(&trigger->consume_state, __ATOMIC_ACQUIRE);
+    for (;;) {
+        uint32_t reserved = old >> 16;
+        if (reserved == 0) return old & TRIGGER_SUCCESS_MASK;
+        uint32_t desired = old - TRIGGER_RESERVE_ONE + (success ? 1u : 0u);
+        if (__atomic_compare_exchange_n(&trigger->consume_state, &old, desired,
+                                        false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            return desired & TRIGGER_SUCCESS_MASK;
+        }
+    }
+}
+
 void qbdi_trace_init_state(void) {
     g_thread_triggers = NULL;
     g_inside_qbdi_trace = 0;
@@ -1222,8 +1273,7 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx) {
         memset(ts->selected, 0, (size_t)ts->count);
         for (int i = 0; i < spec->trigger_count; i++) {
             TraceTrigger *tr = &spec->triggers[i];
-            if (spec->trigger_once &&
-                __atomic_load_n(&tr->consume_state, __ATOMIC_ACQUIRE) == 2) {
+            if (trigger_exhausted(spec, tr)) {
                 ts->armed[i] = 0;
                 continue;
             }
@@ -1244,16 +1294,12 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx) {
                 ts->selected[i] = 1;
             }
         }
-        if (spec->trigger_once) {
-            /* 先原子占用匹配条件，防止两个线程把“仅一次”同时用成两次。
-             * trace 失败会释放占用，只有真正跑到 end 才标记已消耗。 */
+        if (spec->trigger_policy != TRIG_CONSUME_REPEAT) {
+            /* 先原子预占匹配条件的额度，防止并发越过单条条件上限。
+             * trace 失败会释放预占，只有真正跑到 end 才计入成功次数。 */
             for (int i = 0; i < spec->trigger_count; i++) {
                 if (!ts->selected[i]) continue;
-                int expected = 0;
-                if (__atomic_compare_exchange_n(&spec->triggers[i].consume_state,
-                                                &expected, 1, false,
-                                                __ATOMIC_ACQ_REL,
-                                                __ATOMIC_ACQUIRE)) {
+                if (trigger_reserve(spec, &spec->triggers[i])) {
                     has_authorization = true;
                 } else {
                     ts->selected[i] = 0;
@@ -1272,11 +1318,10 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx) {
     int remaining_after = __atomic_sub_fetch(&g_remaining[idx], 1, __ATOMIC_SEQ_CST);
     if (remaining_after < 0) {
         __atomic_add_fetch(&g_remaining[idx], 1, __ATOMIC_SEQ_CST); /* 还回去 */
-        if (spec->trigger_once && ts != NULL) {
+        if (spec->trigger_policy != TRIG_CONSUME_REPEAT && ts != NULL) {
             for (int i = 0; i < spec->trigger_count; i++) {
                 if (ts->selected[i]) {
-                    __atomic_store_n(&spec->triggers[i].consume_state, 0,
-                                     __ATOMIC_RELEASE);
+                    trigger_finish(&spec->triggers[i], false);
                 }
             }
         }
@@ -1288,7 +1333,9 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx) {
                         "(thread=%p, policy=%s)\n",
                         spec->module, (unsigned long long)spec->static_start,
                         (void *)pthread_self(),
-                        spec->trigger_once ? "once" : "repeat");
+                        spec->trigger_policy == TRIG_CONSUME_ONCE ? "once"
+                        : spec->trigger_policy == TRIG_CONSUME_CUSTOM ? "custom"
+                                                                     : "repeat");
     }
     /* QBDI 在虚拟栈上只做「记录」;输出寄存器丢弃,恢复 hook 点输入寄存器,
      * 然后跳回 origin 让区域代码原生执行一遍,保证 app 状态正确。
@@ -1312,17 +1359,17 @@ uint64_t trace_ctx_entry(TraceRegFile *rf, int idx) {
                 if (spec->triggers[i].address != spec->static_start) {
                     ts->armed[i] = 0;
                 }
-                if (spec->trigger_once) {
-                    __atomic_store_n(&spec->triggers[i].consume_state, 2,
-                                     __ATOMIC_RELEASE);
+                if (spec->trigger_policy != TRIG_CONSUME_REPEAT) {
+                    uint32_t used = trigger_finish(&spec->triggers[i], true);
+                    int limit = trigger_success_limit(spec, &spec->triggers[i]);
                     qbdi_trace_logf(
-                        "[%s] trigger[%d] consumed after successful trace#%d\n",
+                        "[%s] trigger[%d] usage %u/%d after successful trace#%d\n",
                         spec->module, i + 1,
+                        used, limit,
                         spec->count - remaining_after - 1);
                 }
-            } else if (spec->trigger_once) {
-                __atomic_store_n(&spec->triggers[i].consume_state, 0,
-                                 __ATOMIC_RELEASE);
+            } else if (spec->trigger_policy != TRIG_CONSUME_REPEAT) {
+                trigger_finish(&spec->triggers[i], false);
             }
         }
         if (!completed) {
@@ -1373,8 +1420,7 @@ uint64_t trigger_ctx_entry(TraceRegFile *rf, int hook_idx) {
     for (int i = 0; i < spec->trigger_count; i++) {
         TraceTrigger *tr = &spec->triggers[i];
         if (tr->address != address) continue;
-        if (spec->trigger_once &&
-            __atomic_load_n(&tr->consume_state, __ATOMIC_ACQUIRE) == 2) {
+        if (trigger_exhausted(spec, tr)) {
             ts->armed[i] = 0;
             continue;
         }

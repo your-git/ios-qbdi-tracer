@@ -61,6 +61,7 @@ extract_fn() {
   extract_fn 'static uint64_t parse_hex'
   extract_fn 'static bool parse_hex_strict'
   extract_fn 'static uint64_t parse_size'
+  extract_fn 'static int parse_int'
   extract_fn 'static const char *dup_str'
   extract_fn 'static bool load_trigger'
 } > "$OUT/engine_trigger.inc"
@@ -76,6 +77,10 @@ grep -q 'load_trigger' "$OUT/engine_trigger.inc" || \
 } > "$OUT/trig_compare.inc"
 grep -q 'trig_compare' "$OUT/trig_compare.inc" || \
     { echo "提取失败:qbdi_trace.c 里没找到 trig_compare"; exit 1; }
+awk '/^#define TRIGGER_SUCCESS_MASK/{f=1} f&&/^void qbdi_trace_init_state/{exit} f' \
+    "$ENGINE_SRC/qbdi_trace.c" > "$OUT/trigger_consume.inc"
+grep -q 'trigger_reserve' "$OUT/trigger_consume.inc" || \
+    { echo "提取失败:qbdi_trace.c 里没找到 trigger_reserve"; exit 1; }
 clang -fobjc-arc $CFLAGS -I"$OUT" -I"$ENGINE_SRC" -framework Foundation \
       "$ROOT/tests/trigger_test.m" "$ENGINE_SRC/watch_expr.c" -o "$OUT/t4"
 "$OUT/t4"

@@ -32,8 +32,8 @@
 | `src/FormEditVC.{h,m}` | ~120 | 表单编辑页**基类**:快照 / 脏检查 / 「放弃修改?」确认；编辑页显示期间一律禁用右滑返回。TraceEditVC 和 WatchEditVC 都继承它 |
 | `src/RootListVC.m` | ~450 | 主界面。总开关 + 条目列表。点击=编辑,前缘滑=启停,尾缘滑=命名/导出/复制/删除。自定义名称存在时用三行展示，旧 JSON 仍用两行 |
 | `src/AppPickerVC.m` | 141 | 应用选择器。`LSApplicationWorkspace`(私有 API)列所有 app 图标+名字+bundleId,带搜索 |
-| `src/TraceEditVC.m` | ~400 | trace 表单。恢复 1–16 次；触发条件为不限数量的子表，含 repeat/once 消耗策略和地址间距校验 |
-| `src/TriggerEditVC.m` | ~330 | 单条触发条件编辑页；表达式、地址快捷键、匹配方式和期望值校验 |
+| `src/TraceEditVC.m` | ~400 | trace 表单。恢复 1–16 次；触发条件为不限数量的子表，含 repeat/once/custom 消耗策略和地址间距校验 |
+| `src/TriggerEditVC.m` | ~350 | 单条触发条件编辑页；custom 下显示 1–16 的触发次数上限，并负责表达式、地址、匹配与期望值校验 |
 | `src/WatchEditVC.m` | ~217 | watch 表单。寄存器/action 用 action sheet;寄存器那栏顶部的「✎ 输入取址表达式…」走 `ExprInput` 的弹窗;size 走 `HexValue` |
 | `src/ImportVC.m` | ~110 | **从文件导入**列表页。列 exportDir 里的 .json,点选 → 校验 → 加入 items |
 | `Resources/Info.plist` | - | **必须在 Resources/**,否则图标不出现。bundleId=`com.snk.qbditracer`。含 `UIFileSharingEnabled`+`LSSupportsOpeningDocumentsInPlace`(导出文件供 Finder 文件共享取出) |
@@ -92,7 +92,8 @@
    和 `trigger_hit`(负责读内存)、`trigger_log_miss`(诊断输出)
 4. `GUI/src/TriggerEditVC.m` —— 单条条件表单和校验；`TraceEditVC.m` 负责条件列表与地址间距
 
-新格式使用 item 级 `triggers` 数组和 `triggerConsume`；旧版扁平 `trigger*` 字段仍会迁移/加载。
+新格式使用 item 级 `triggers` 数组和 `triggerConsume`；custom 策略读取每条条件的
+`triggerLimit`（缺省 1）。旧版扁平 `trigger*` 字段仍会迁移/加载。
 地址缺失/留空/等于 start 使用 start Hook；其余不同地址使用 `g_trigger_tramps`，相同地址共享 Hook。
 命中后用按条件数量分配的线程局部状态授权同线程下一次 start，不要改成全局 bool。
 
@@ -162,7 +163,7 @@
 16. **触发条件的「字符串」不是 watch 的 `cstr`**:watch 的 `cstr` 是"读到 `\0` 然后打印出来";触发条件的「字符串」是拿期望值去比较。而且**用「字符串」填十六进制是常见误用** —— 填 `08a48c90` 会拿 ASCII 文本 `"08a48c90"`(`30 38 61 34…`)去比二进制 `08 a4 8c 90`,永远不匹配。二进制数据要用「字节」。
 17. **`vm_read_overwrite` 跨到未映射页会整块失败**(返回 0,不是"读到一部分")。所以 `trigger_read()` 在整块失败时退到"只读本页末尾"。任何"读一个窗口"的新代码都要照这个处理,否则窗口一调大就什么都读不到。
 18. **在每次 hook 命中都跑的代码里,成本是 mach trap 次数,不是字节数**。`trigger_hit` 一次读满窗口(而不是像 `watch_read_string` 那样每 64 字节一趟),所以 `contains` 和 `prefix` 速度基本一样。新增这类逻辑时别退化成分块读。
-19. **同一个 hook 点会被多个线程同时命中**,所以 `g_remaining`、每条条件的 `consume_state`、`filtered`、`next_log` 都必须原子访问。once 策略用 `0=可用/1=占用中/2=已消耗`，失败必须从 1 释放回 0。日志整段仍需一次加锁。
+19. **同一个 hook 点会被多个线程同时命中**,所以 `g_remaining`、每条条件的 `consume_state`、`filtered`、`next_log` 都必须原子访问。`consume_state` 低 16 位是成功次数、高 16 位是进行中预占；once/custom 先预占，成功转成计数，失败释放。日志整段仍需一次加锁。
 20. **不要再恢复固定 1000 万条静默截断**:`qbdi_run` 的返回值只表示至少执行了一个 block，`ok=1` 不代表已到 end。旧逻辑在 `inst=10000001 ok=1` 时已经是被上限强制停止。现在 `maxInstructions` 缺省/0 不再按指令数截断，非 0 才启用保护；不限制时每 1000 万条向系统控制台报告当前 PC/end，但继续跑。退出日志必须保留 `reason=end|instruction-limit|qbdi-failed|unexpected-stop` 和最终 PC，只有 `state->pc == end` 才可标记 `reason=end`。被上限截断时还要打印 next PC 并写入系统控制台。
 21. **`ConfigStore.m` 的导入白名单**:`importItemFromData` 里那个 key 数组是写死的,**加了 item 级字段就得加进去**,否则"导出→导入"会把新字段静默丢掉。
 22. **别用 UTF-8 在二进制里搜中文字符串来验证**:含非 ASCII 的 `@"中文"` NSString 字面量,clang 会编成 **UTF-16** 存进 `__ustring` 段(不是 UTF-8 的 `__cstring`)。用 UTF-8 搜会全部 "missing" —— 这是**误报**,不代表字符串没编进去。要搜就搜 UTF-16LE(`kw.encode('utf-16-le')`)。ASCII 字符串才在 `__cstring` 里。
@@ -292,29 +293,30 @@ GUI 校验与引擎 parser 的判断、size 两侧的进制解析都交叉比对
     退到本页末尾)
 34. 两条条件任意一条命中都可 Trace；相同地址只安装一个 Hook，不同地址相差不足 `0x10` 时保存被挡下
 35. `once` 下成功到 end 后只消耗本次贡献的条件；QBDI 失败/提前停止时条件和 Trace 次数都会恢复
-36. `repeat` 下同一条件可以反复触发，直到完成 1–16 次；第 2 条以后默认继承第 1 条地址和表达式
+36. `custom` 下分别设置 1、2 次的两条条件，各自只能成功对应次数；并发命中不能突破单条上限
+37. `repeat` 下同一条件可以反复触发，直到完成 1–16 次；第 2 条以后默认继承第 1 条地址和表达式，但次数上限固定默认 1
 
 ### trampoline 完整状态保存(本次新增,**最高优先级**)
 
-37. **条件一直不匹配时,程序仍能正常往下跑** —— 表达式算出的地址/内容每次调用都在变,
+38. **条件一直不匹配时,程序仍能正常往下跑** —— 表达式算出的地址/内容每次调用都在变,
     不再出现"同一个值重复几十万次"。这是 NZCV 修复是否生效的判据。
-38. 目标 app 在挂着条件(且长时间不匹配)的情况下,界面不卡、功能正常
-39. 条件命中后 trace 正常输出,且 trace 结束后 app 继续正常运行(不崩、不卡)
-40. 多线程同时命中时:`count=1` 只产生**一份** trace 日志;`trigger miss #N` 的编号不重复
-41. **热路径开销**:条件长期不匹配时,目标 app 仍然流畅(`find_module` 已从每次命中的路径上
+39. 目标 app 在挂着条件(且长时间不匹配)的情况下,界面不卡、功能正常
+40. 条件命中后 trace 正常输出,且 trace 结束后 app 继续正常运行(不崩、不卡)
+41. 多线程同时命中时:`count=1` 只产生**一份** trace 日志;`trigger miss #N` 的编号不重复
+42. **热路径开销**:条件长期不匹配时,目标 app 仍然流畅(`find_module` 已从每次命中的路径上
     移除)。判据是 `trigger miss` 的 `at : lr=... sp=...` 两次之间**有变化** —— 如果 lr/sp
     完全不动,说明还是卡在同一次调用的同一个循环里,得继续查
-42. hook 点选得太热时(每秒命中几十万次)即便只剩 1 次 `vm_read_overwrite` 也会拖慢;
+43. hook 点选得太热时(每秒命中几十万次)即便只剩 1 次 `vm_read_overwrite` 也会拖慢;
     这种情况应该换一个"每次请求只过一遍"的位置,而不是靠优化引擎
-43. **续跑寄存器回归测试**:同一 hook 点让 `x21` 先后指向 `this is a string` 和
+44. **续跑寄存器回归测试**:同一 hook 点让 `x21` 先后指向 `this is a string` 和
     `this is a key`，触发条件设 `x21` + 字符串包含 `key`；第一次应 miss、第二次应命中，
     诊断里的地址/内容必须随调用变化。若始终停在第一次，立即反汇编确认结尾是
     `mov x17, x0` → 恢复 x16 → `br x17`，且中间没有恢复覆盖 x17。
-44. **启停两种入口**:右滑到底自动执行、只露出按钮再点击，两者都应更新勾选并提示“重启目标 App 后生效”；重启后核对 JSON 与引擎行为一致。
-45. **自定义触发地址**:留空/等于 start 保持原行为；低于 start 且间隔≥0x10 可命中；等于/高于 end 命中后，同一线程下一次跳回 start 才 Trace。
-46. 判断地址在 `(start,end)` 内或低地址距 start <0x10 → GUI/引擎都拒绝；与另一条目 Hook 补丁重叠 → 引擎加载时拒绝。系统控制台应有 `[ios-qbdi-tracer]` 诊断。
-47. 用两个线程验证自定义触发:线程 A 命中 trigger 后，线程 B 先到 start 不能 Trace；只有 A 到 start 才能消费授权。
-48. 起始/结束/判断/监视地址输入框都有 `0X 0-9 A-F` 快捷键；非法字符即时标红，「完成」时再做权威校验。
-49. **启停保存失败**:在测试环境临时使配置目录不可写，操作后必须提示失败并恢复原勾选，不得出现假启用/假停用。
-50. **自定义名称**:左滑「命名」后显示三行；再次命名为空后恢复旧两行。名称同时出现在 hook 安装日志中。
-51. **名称兼容性**:旧 JSON 打开无空白行；命名后复制、导出再导入，`traceName` 都不丢失。
+45. **启停两种入口**:右滑到底自动执行、只露出按钮再点击，两者都应更新勾选并提示“重启目标 App 后生效”；重启后核对 JSON 与引擎行为一致。
+46. **自定义触发地址**:留空/等于 start 保持原行为；低于 start 且间隔≥0x10 可命中；等于/高于 end 命中后，同一线程下一次跳回 start 才 Trace。
+47. 判断地址在 `(start,end)` 内或低地址距 start <0x10 → GUI/引擎都拒绝；与另一条目 Hook 补丁重叠 → 引擎加载时拒绝。系统控制台应有 `[ios-qbdi-tracer]` 诊断。
+48. 用两个线程验证自定义触发:线程 A 命中 trigger 后，线程 B 先到 start 不能 Trace；只有 A 到 start 才能消费授权。
+49. 起始/结束/判断/监视地址输入框都有 `0X 0-9 A-F` 快捷键；非法字符即时标红，「完成」时再做权威校验。
+50. **启停保存失败**:在测试环境临时使配置目录不可写，操作后必须提示失败并恢复原勾选，不得出现假启用/假停用。
+51. **自定义名称**:左滑「命名」后显示三行；再次命名为空后恢复旧两行。名称同时出现在 hook 安装日志中。
+52. **名称兼容性**:旧 JSON 打开无空白行；命名后复制、导出再导入，`traceName` 都不丢失。

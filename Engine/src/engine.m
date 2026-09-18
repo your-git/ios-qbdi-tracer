@@ -150,9 +150,16 @@ static bool load_trigger(NSDictionary *it, const TraceSpec *owner,
     t->expr  = NULL;
     t->want_nbytes   = 0;
     t->want_u64      = 0;
+    t->max_traces    = parse_int(it[@"triggerLimit"], 1);
     t->address = owner->static_start;
     t->next_log = 1;
     memset(&t->cexpr, 0, sizeof(t->cexpr));
+
+    if (t->max_traces < 1 || t->max_traces > 16) {
+        snprintf(err, errcap, "triggerLimit must be 1..16, got %d",
+                 t->max_traces);
+        return false;
+    }
 
     const char *expr = dup_str(it[@"triggerExpr"]);
     if (expr == NULL) {
@@ -327,7 +334,19 @@ static bool load_triggers(NSDictionary *item, TraceSpec *spec,
                   [item[@"triggerExpr"] isKindOfClass:[NSString class]] &&
                   [item[@"triggerExpr"] length] > 0;
     NSUInteger count = arr != nil ? arr.count : (legacy ? 1u : 0u);
-    spec->trigger_once = [item[@"triggerConsume"] isEqual:@"once"] ? 1 : 0;
+    NSString *policy = [item[@"triggerConsume"] isKindOfClass:[NSString class]]
+                           ? item[@"triggerConsume"] : @"repeat";
+    if ([policy isEqualToString:@"once"]) {
+        spec->trigger_policy = TRIG_CONSUME_ONCE;
+    } else if ([policy isEqualToString:@"custom"]) {
+        spec->trigger_policy = TRIG_CONSUME_CUSTOM;
+    } else if ([policy isEqualToString:@"repeat"]) {
+        spec->trigger_policy = TRIG_CONSUME_REPEAT;
+    } else {
+        snprintf(err, errcap, "unknown triggerConsume \"%s\"",
+                 [policy UTF8String]);
+        return false;
+    }
     if (count == 0) return true;
 
     spec->triggers = calloc(count, sizeof(TraceTrigger));
@@ -723,13 +742,19 @@ void engine_start(void) {
             }
             for (int i = 0; i < t->trigger_count; i++) {
                 TraceTrigger *tr = &t->triggers[i];
-                qbdi_trace_logf("[%s] trigger[%d]: %s (%s) at 0x%llx policy=%s\n",
+                int effective_limit = t->trigger_policy == TRIG_CONSUME_ONCE ? 1
+                                    : t->trigger_policy == TRIG_CONSUME_CUSTOM
+                                          ? tr->max_traces : 0;
+                qbdi_trace_logf("[%s] trigger[%d]: %s (%s) at 0x%llx policy=%s limit=%d\n",
                                 t->module, i + 1, tr->expr,
                                 tr->match == TRIG_NOTNULL ? "notnull"
                                 : tr->match == TRIG_BYTES ? "bytes"
                                 : tr->match == TRIG_CSTR  ? "cstr" : "u64",
                                 (unsigned long long)tr->address,
-                                t->trigger_once ? "once" : "repeat");
+                                t->trigger_policy == TRIG_CONSUME_ONCE ? "once"
+                                : t->trigger_policy == TRIG_CONSUME_CUSTOM ? "custom"
+                                                                           : "repeat",
+                                effective_limit);
             }
             load_watches(it[@"watches"]);
             g_trace_count++;

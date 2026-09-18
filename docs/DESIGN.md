@@ -150,8 +150,10 @@ start hook 命中且有授权 → 消费授权 → run_trace
 `g_remaining[idx]` 递减之前,不匹配不浪费 Trace 次数；Trace 未成功到达 end 时也会归还次数。
 相同判断地址的条件共享一个 Dobby Hook，不同地址必须至少相差 `0x10`。
 
-`triggerConsume=once` 时，每条条件只在成功 Trace 后消耗一次，并用原子状态避免两个线程
-同时消费；失败会释放占用。`repeat` 为兼容旧配置的默认策略。
+`triggerConsume=once` 时，每条条件只在成功 Trace 后消耗一次；`custom` 使用条件内的
+`triggerLimit`（1..16，缺省 1）作为独立上限；`repeat` 不限制单条条件并作为旧配置默认值。
+低 16 位成功次数 + 高 16 位进行中预占组成一个原子状态，避免多个线程同时突破上限；
+失败会释放预占，不计条件次数，也会归还 Trace 总次数。
 
 四种匹配方式(`TrigMatch`)× 两种位置(`TrigWhere`),都在 `config.h`:
 
@@ -263,11 +265,12 @@ after N filtered calls`。
                                       // 界面已不再暴露这一栏,新建/编辑后统一写 17
                                       // (INST|VREG);引擎照旧按字段值跑,旧配置不受影响
       "maxInstructions": 0,           // 可选;0/缺省=跑到 end,非 0=达上限时截断
-      "triggerConsume": "repeat",     // repeat | once
+      "triggerConsume": "repeat",     // repeat | once | custom
       "triggers": [                    // 空数组=无条件;数量不设 UI/配置上限
         { "triggerExpr": "[x2+0x10]", "triggerAddress": "0x27A1F400",
           "triggerMatch": "bytes", "triggerValue": "08a48c90",
-          "triggerWhere": "prefix", "triggerScan": "0x100" }
+          "triggerWhere": "prefix", "triggerScan": "0x100",
+          "triggerLimit": 1 }          // custom 下生效，范围 1..16
       ],
       "watches": [
         { "module": "ModuleName", "offset": "0x27A1F4E8",

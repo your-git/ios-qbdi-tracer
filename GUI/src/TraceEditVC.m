@@ -82,6 +82,13 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
         for (NSDictionary *tr in old) if ([tr isKindOfClass:[NSDictionary class]]) [copy addObject:[tr mutableCopy]];
         self.item[@"triggers"] = copy;
     }
+    NSMutableArray *triggers = self.item[@"triggers"];
+    for (NSUInteger i = 0; i < triggers.count; i++) {
+        NSMutableDictionary *trigger = [triggers[i] isKindOfClass:[NSMutableDictionary class]]
+                                           ? triggers[i] : [triggers[i] mutableCopy];
+        if (trigger[@"triggerLimit"] == nil) trigger[@"triggerLimit"] = @1;
+        if (trigger != nil) triggers[i] = trigger;
+    }
     if (self.item[@"triggerConsume"] == nil) self.item[@"triggerConsume"] = @"repeat";
     [self beginEditingTarget:self.item];
 }
@@ -157,7 +164,10 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
         if (ip.row == 0) {
             UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
             c.textLabel.text = @"触发消耗策略";
-            c.detailTextLabel.text = [self.item[@"triggerConsume"] isEqual:@"once"] ? @"仅一次" : @"可重复";
+            NSString *policy = self.item[@"triggerConsume"];
+            c.detailTextLabel.text = [policy isEqual:@"once"] ? @"仅一次"
+                                   : [policy isEqual:@"custom"] ? @"自定义"
+                                                                 : @"可重复";
             c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
             return c;
         }
@@ -174,7 +184,15 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
         NSString *address = rawAddress.length ? rawAddress : @"起始地址";
         c.textLabel.text = [NSString stringWithFormat:@"%@ · %@", address, tr[@"triggerExpr"] ?: @""];
         NSDictionary *names = @{ @"notnull": @"非空", @"bytes": @"字节", @"cstr": @"字符串", @"u64": @"u64" };
-        c.detailTextLabel.text = names[tr[@"triggerMatch"] ?: @"notnull"];
+        NSString *match = names[tr[@"triggerMatch"] ?: @"notnull"];
+        if ([self.item[@"triggerConsume"] isEqual:@"custom"]) {
+            NSInteger limit = [tr[@"triggerLimit"] integerValue];
+            if (limit < 1) limit = 1;
+            c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 上限 %ld 次",
+                                      match, (long)limit];
+        } else {
+            c.detailTextLabel.text = match;
+        }
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return c;
     }
@@ -232,13 +250,25 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
 
 - (void)pickPolicy:(UITableViewCell *)source {
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"触发消耗策略" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    NSArray *labels = @[ @"仅一次", @"可重复" ];
-    NSArray *keys = @[ @"once", @"repeat" ];
+    NSArray *labels = @[ @"仅一次", @"可重复", @"自定义" ];
+    NSArray *keys = @[ @"once", @"repeat", @"custom" ];
     for (NSUInteger i = 0; i < labels.count; i++) {
         NSString *key = keys[i];
         [sheet addAction:[UIAlertAction actionWithTitle:labels[i] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             self.item[@"triggerConsume"] = key;
             [self.tableView reloadData]; [self updatePopGesture];
+            if ([key isEqualToString:@"custom"]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIAlertController *notice = [UIAlertController
+                        alertControllerWithTitle:@"自定义触发次数"
+                                         message:@"请进入每一条触发条件的编辑页面，设置该条件的“触发次数上限”。新条件和旧配置的默认上限都是 1 次。"
+                                  preferredStyle:UIAlertControllerStyleAlert];
+                    [notice addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                                               style:UIAlertActionStyleDefault
+                                                             handler:nil]];
+                    [self presentViewController:notice animated:YES completion:nil];
+                });
+            }
         }]];
     }
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -256,6 +286,7 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
         if (adding) {
             tr = [@{ @"triggerAddress": @"", @"triggerExpr": @"", @"triggerMatch": @"notnull",
                      @"triggerValue": @"", @"triggerWhere": @"prefix", @"triggerScan": @"0x100" } mutableCopy];
+            tr[@"triggerLimit"] = @1;
             NSDictionary *first = triggers.firstObject;
             if (first != nil) {
                 if (first[@"triggerAddress"] != nil) tr[@"triggerAddress"] = first[@"triggerAddress"];
@@ -265,7 +296,10 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
         unsigned long long start = 0, end = 0;
         HexParseInput([self.item[@"start"] description], &start);
         HexParseInput([self.item[@"end"] description], &end);
-        TriggerEditVC *vc = [[TriggerEditVC alloc] initWithTrigger:tr start:start end:end];
+        BOOL customLimit = [self.item[@"triggerConsume"] isEqual:@"custom"];
+        TriggerEditVC *vc = [[TriggerEditVC alloc] initWithTrigger:tr start:start
+                                                               end:end
+                                                       customLimit:customLimit];
         __weak typeof(self) weakSelf = self;
         vc.onDone = ^{ if (adding) [triggers addObject:tr]; [weakSelf.tableView reloadData]; };
         [self.navigationController pushViewController:vc animated:YES];
@@ -308,6 +342,14 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
     NSMutableArray<NSNumber *> *addresses = [NSMutableArray array];
     for (NSUInteger i = 0; i < triggers.count; i++) {
         NSDictionary *tr = triggers[i];
+        if ([self.item[@"triggerConsume"] isEqual:@"custom"] &&
+            !TraceCountTextValid([tr[@"triggerLimit"] description], NULL)) {
+            [self alert:@"触发次数上限无效"
+                message:[NSString stringWithFormat:
+                    @"第 %lu 条触发条件的次数上限必须是 1–16。",
+                    (unsigned long)i + 1]];
+            return NO;
+        }
         if (!ExprSyntaxOK(tr[@"triggerExpr"])) {
             [self alert:@"触发条件无效" message:[NSString stringWithFormat:@"第 %lu 条触发条件的取址表达式无效。", (unsigned long)i + 1]]; return NO;
         }

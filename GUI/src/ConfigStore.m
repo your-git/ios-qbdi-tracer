@@ -70,6 +70,7 @@
                                 copy[@"triggerAddress"] = [NSString stringWithFormat:
                                     @"0x%llx", [address unsignedLongLongValue]];
                             }
+                            if (copy[@"triggerLimit"] == nil) copy[@"triggerLimit"] = @1;
                             [mt addObject:copy];
                         }
                     }
@@ -86,6 +87,7 @@
                         legacy[@"triggerAddress"] = [NSString stringWithFormat:
                             @"0x%llx", [address unsignedLongLongValue]];
                     }
+                    legacy[@"triggerLimit"] = @1;
                     [mt addObject:legacy];
                 }
                 m[@"triggers"] = mt;
@@ -295,6 +297,7 @@ static NSString *sanitizeName(NSString *s) {
                     copy[@"triggerAddress"] = [NSString stringWithFormat:
                         @"0x%llx", [address unsignedLongLongValue]];
                 }
+                if (copy[@"triggerLimit"] == nil) copy[@"triggerLimit"] = @1;
                 [mt addObject:copy];
             }
         }
@@ -311,6 +314,7 @@ static NSString *sanitizeName(NSString *s) {
             legacy[@"triggerAddress"] = [NSString stringWithFormat:
                 @"0x%llx", [address unsignedLongLongValue]];
         }
+        legacy[@"triggerLimit"] = @1;
         [mt addObject:legacy];
     }
     out[@"triggers"] = mt;
