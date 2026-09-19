@@ -384,6 +384,152 @@ static bool load_triggers(NSDictionary *item, TraceSpec *spec,
     return true;
 }
 
+static bool parse_mutation_reg(id value, uint8_t *index) {
+    if (![value isKindOfClass:[NSString class]] || index == NULL) return false;
+    NSString *name = [value lowercaseString];
+    if ([name isEqualToString:@"fp"]) {
+        *index = 29;
+        return true;
+    }
+    if ([name isEqualToString:@"lr"]) {
+        *index = 30;
+        return true;
+    }
+    if (![name hasPrefix:@"x"] || name.length < 2) return false;
+    NSScanner *scanner = [NSScanner scannerWithString:[name substringFromIndex:1]];
+    NSInteger n = -1;
+    if (![scanner scanInteger:&n] || !scanner.isAtEnd || n < 0 || n > 28 || n == 17) {
+        return false;
+    }
+    *index = (uint8_t)n;
+    return true;
+}
+
+static bool parse_mutation_width(id value, uint8_t *width) {
+    if (width == NULL) return false;
+    if (value == nil) {
+        *width = 64;
+        return true;
+    }
+    if ([value isKindOfClass:[NSNumber class]]) {
+        if ([value isEqualToNumber:@32]) { *width = 32; return true; }
+        if ([value isEqualToNumber:@64]) { *width = 64; return true; }
+        return false;
+    }
+    if ([value isKindOfClass:[NSString class]]) {
+        NSString *text = [value stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([text isEqualToString:@"32"]) { *width = 32; return true; }
+        if ([text isEqualToString:@"64"]) { *width = 64; return true; }
+    }
+    return false;
+}
+
+/* Trace 内寄存器修改。配置错误时拒绝整条 trace，避免用户以为覆盖已经生效。 */
+static bool load_mutations(NSDictionary *item, TraceSpec *spec,
+                           char *err, size_t errcap) {
+    id raw = item[@"mutations"];
+    if (raw == nil) return true; /* 旧 JSON */
+    if (![raw isKindOfClass:[NSArray class]]) {
+        snprintf(err, errcap, "mutations must be an array");
+        return false;
+    }
+    NSArray *arr = raw;
+    if (arr.count == 0) return true;
+    spec->mutations = calloc(arr.count, sizeof(TraceMutation));
+    if (spec->mutations == NULL) {
+        snprintf(err, errcap, "out of memory for %lu mutations",
+                 (unsigned long)arr.count);
+        return false;
+    }
+    for (NSUInteger i = 0; i < arr.count; i++) {
+        NSDictionary *src = arr[i];
+        if (![src isKindOfClass:[NSDictionary class]]) {
+            snprintf(err, errcap, "mutation %lu is not an object",
+                     (unsigned long)i + 1);
+            free(spec->mutations);
+            spec->mutations = NULL;
+            spec->mutation_count = 0;
+            return false;
+        }
+        if (!parse_bool(src[@"enabled"], true)) continue;
+
+        TraceMutation *dst = &spec->mutations[spec->mutation_count];
+        if (!parse_hex_strict(src[@"offset"], &dst->offset)) {
+            snprintf(err, errcap, "mutation %lu has invalid offset",
+                     (unsigned long)i + 1);
+            free(spec->mutations);
+            spec->mutations = NULL;
+            spec->mutation_count = 0;
+            return false;
+        }
+        if (!parse_hex_strict(src[@"value"], &dst->value)) {
+            snprintf(err, errcap, "mutation %lu has invalid value",
+                     (unsigned long)i + 1);
+            free(spec->mutations);
+            spec->mutations = NULL;
+            spec->mutation_count = 0;
+            return false;
+        }
+        if (!parse_mutation_reg(src[@"reg"], &dst->reg_index)) {
+            snprintf(err, errcap,
+                     "mutation %lu register must be x0..x28 except x17, fp or lr",
+                     (unsigned long)i + 1);
+            free(spec->mutations);
+            spec->mutations = NULL;
+            spec->mutation_count = 0;
+            return false;
+        }
+        uint8_t width = 0;
+        if (!parse_mutation_width(src[@"width"], &width) ||
+            (dst->reg_index >= 29 && width != 64)) {
+            snprintf(err, errcap, "mutation %lu has invalid register width",
+                     (unsigned long)i + 1);
+            free(spec->mutations);
+            spec->mutations = NULL;
+            spec->mutation_count = 0;
+            return false;
+        }
+        if (width == 32 && dst->value > UINT32_MAX) {
+            snprintf(err, errcap, "mutation %lu value does not fit in 32 bits",
+                     (unsigned long)i + 1);
+            free(spec->mutations);
+            spec->mutations = NULL;
+            spec->mutation_count = 0;
+            return false;
+        }
+        id applyValue = src[@"apply"];
+        if (applyValue != nil && ![applyValue isKindOfClass:[NSString class]]) {
+            snprintf(err, errcap, "mutation %lu has invalid apply mode",
+                     (unsigned long)i + 1);
+            free(spec->mutations);
+            spec->mutations = NULL;
+            spec->mutation_count = 0;
+            return false;
+        }
+        NSString *apply = applyValue ?: @"once";
+        if ([apply isEqualToString:@"once"]) {
+            dst->every_hit = 0;
+        } else if ([apply isEqualToString:@"always"]) {
+            dst->every_hit = 1;
+        } else {
+            snprintf(err, errcap, "mutation %lu has unknown apply mode",
+                     (unsigned long)i + 1);
+            free(spec->mutations);
+            spec->mutations = NULL;
+            spec->mutation_count = 0;
+            return false;
+        }
+        dst->width = width;
+        spec->mutation_count++;
+    }
+    if (spec->mutation_count == 0) {
+        free(spec->mutations);
+        spec->mutations = NULL;
+    }
+    return true;
+}
+
 static bool hook_patches_overlap(uint64_t a, uint64_t b) {
     uint64_t hi = a > b ? a : b;
     uint64_t lo = a > b ? b : a;
@@ -728,6 +874,12 @@ void engine_start(void) {
                 memset(t, 0, sizeof(*t));
                 continue;
             }
+            if (!load_mutations(it, t, terr, sizeof(terr))) {
+                qbdi_trace_logf("[engine] skip item (slot %d): bad mutation: %s\n",
+                                slot, terr);
+                memset(t, 0, sizeof(*t));
+                continue;
+            }
             int conflict_slot = -1;
             uint64_t this_hook = 0, other_hook = 0;
             if (find_hook_conflict(t, &conflict_slot, &this_hook, &other_hook)) {
@@ -755,6 +907,22 @@ void engine_start(void) {
                                 : t->trigger_policy == TRIG_CONSUME_CUSTOM ? "custom"
                                                                            : "repeat",
                                 effective_limit);
+            }
+            for (int i = 0; i < t->mutation_count; i++) {
+                TraceMutation *m = &t->mutations[i];
+                char reg[8];
+                if (m->reg_index <= 28) {
+                    snprintf(reg, sizeof(reg), "%c%u", m->width == 32 ? 'w' : 'x',
+                             (unsigned)m->reg_index);
+                } else {
+                    snprintf(reg, sizeof(reg), "%s", m->reg_index == 29 ? "fp" : "lr");
+                }
+                qbdi_trace_logf(
+                    "[%s] mutation[%d]: at 0x%llx set %s=0x%llx apply=%s "
+                    "scope=trace-only\n",
+                    t->module, i + 1, (unsigned long long)m->offset, reg,
+                    (unsigned long long)m->value,
+                    m->every_hit ? "always" : "once");
             }
             load_watches(it[@"watches"]);
             g_trace_count++;

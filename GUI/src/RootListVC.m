@@ -26,6 +26,7 @@ static BOOL traceEnabled(NSDictionary *item) {
               done:(void (^)(BOOL))done;
 - (void)showTriggerNotice;
 - (void)showTriggerPolicy;
+- (void)showMutationHelp;
 @end
 
 @implementation RootListVC
@@ -72,6 +73,11 @@ static BOOL traceEnabled(NSDictionary *item) {
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) {
               [self showTriggerPolicy];
+          }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Trace 内寄存器修改"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+              [self showMutationHelp];
           }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"查看 Trace 日志输出位置"
                                            style:UIAlertActionStyleDefault
@@ -478,6 +484,28 @@ static BOOL traceEnabled(NSDictionary *item) {
     [self presentViewController:ac animated:YES completion:nil];
 }
 
+- (void)showMutationHelp {
+    NSString *message =
+        @"该功能只覆盖 QBDI 虚拟执行上下文中的寄存器，不修改真实 App 的寄存器或内存。"
+        @"Trace 结束后原始现场会恢复，但被改写分支在 Trace 内产生的文件、网络、"
+        @"系统调用等外部副作用不会自动撤销。\n\n"
+        @"静态地址是当前 Trace 模块的相对地址，规则会在该地址的指令执行前生效。"
+        @"修改点使用 QBDI 指令回调，不会在该地址额外安装 Dobby Hook。"
+        @"如果要改变 load 指令或函数调用产生的返回值，应把规则设在它的下一条指令，"
+        @"否则随后执行的 load/调用会再次覆盖寄存器。该地址不要求位于起止地址的数值区间，"
+        @"但只有动态执行路径确实经过它时才会生效。\n\n"
+        @"“每次 Trace 仅一次”表示一轮 Trace 中首次命中生效；“每次命中”适合循环，"
+        @"每次经过该地址都会覆盖。同地址多条规则按列表从上到下执行。\n\n"
+        @"支持 x0–x28（不含 x17）、fp、lr。32 位模式等价于写 wN，会清零高 32 位；"
+        @"fp、lr 只支持 64 位。不支持 sp、pc，也不会修改内存字节。";
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Trace 内寄存器修改" message:message
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"关闭"
+        style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 - (void)reloadItem:(NSMutableDictionary *)item {
     NSUInteger row = [[self store].items indexOfObjectIdenticalTo:item];
     if (row == NSNotFound) return;
@@ -521,6 +549,11 @@ static BOOL traceEnabled(NSDictionary *item) {
         [mt addObject:[tr mutableCopy]];
     }
     copy[@"triggers"] = mt;
+    NSMutableArray *mm = [NSMutableArray array];
+    for (NSDictionary *mutation in src[@"mutations"]) {
+        [mm addObject:[mutation mutableCopy]];
+    }
+    copy[@"mutations"] = mm;
     [[self store].items insertObject:copy atIndex:indexPath.row + 1];
     [self persist];
     [self.tableView reloadData];

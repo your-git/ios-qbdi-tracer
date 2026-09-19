@@ -236,6 +236,7 @@ after N filtered calls`。
 
 - **trace 配置** → JSON `items`,运行期解析,不用重编译
 - **watch 配置** → JSON `items[].watches`
+- **Trace 内寄存器修改** → JSON `items[].mutations`，仅改变 QBDI `GPRState`
 - **延迟 / logMask** → 每条目独立字段 `delaySecs` / `logMask`
 - **改配置** → 手机上改 → 重开目标 app 生效
 
@@ -272,6 +273,14 @@ after N filtered calls`。
           "triggerWhere": "prefix", "triggerScan": "0x100",
           "triggerLimit": 1 }          // custom 下生效，范围 1..16
       ],
+      "mutations": [                   // 缺失/空数组=不修改，兼容旧 JSON
+        { "enabled": true,
+          "offset": "0x27A1F4E8",      // 当前 trace 模块的静态偏移
+          "reg": "x8",                 // x0..x28(不含 x17)、fp、lr
+          "width": 32,                  // 32=wN 且高位清零；64=xN
+          "value": "0x2",
+          "apply": "once" }            // once=每轮首次；always=每次命中
+      ],
       "watches": [
         { "module": "ModuleName", "offset": "0x27A1F4E8",
           "reg": "x0", "action": "cstr", "size": "0x0", "label": "url" },
@@ -287,11 +296,18 @@ after N filtered calls`。
 
 **地址是相对模块基址的偏移**,和 Frida `module_base.add(x)` 一致 —— 不是绝对 VA,不要加 slide。引擎用 `_dyld_get_image_header` 取运行时基址(已含 slide)。
 
+`mutations` 在全局 `QBDI_PREINST` 回调中、目标指令执行前按数组顺序应用。地址不做
+`start/end` 数值区间限制：控制流可以跳到区间数值外，只有 QBDI 动态路径实际执行到该地址
+才会生效；修改点不额外安装 Dobby Hook。自动 Hook 路径在 QBDI 返回后恢复入口现场，
+因此寄存器覆盖不会写回真实 App；
+但 Trace 内走到的系统调用、文件、网络等外部副作用不会回滚。要覆盖 load/函数调用的结果，
+规则应设在它的下一条指令。禁止 `sp`、`pc` 和 Dobby 跳板占用的 `x17`。
+
 **`size` 的进制看前缀**:`"0x110"` = 272,`"110"` = 110(十进制),裸数字 `272` = 272。旧配置里 size 是十进制数字,新 App 写出来一律是 `"0x..."` 字符串,靠前缀区分,不需要迁移。`start`/`end`/`offset` 则一律按十六进制解(带不带 `0x` 都一样)。
 
 ## 6.5 导出 / 导入
 
-- **导出**(trace 条目左滑「导出」):把该 item(含 watches)包成 `{"version":1,"item":{...}}` 写到 **App 沙盒 Documents**(`ConfigStore exportDir`,运行时探测)。文件名 `<appName净化><年月日时分>.json`(如 `Demo202608191647.json`)。成功弹框显示**实际落地完整路径**。
+- **导出**(trace 条目左滑「导出」):把该 item(含 triggers/mutations/watches)包成 `{"version":1,"item":{...}}` 写到 **App 沙盒 Documents**(`ConfigStore exportDir`,运行时探测)。文件名 `<appName净化><年月日时分>.json`(如 `Demo202608191647.json`)。成功弹框显示**实际落地完整路径**。
 - **取出**:App 的 Info.plist 开了 `UIFileSharingEnabled`+`LSSupportsOpeningDocumentsInPlace`,用户用 Finder 连手机 → 文件共享 → QBDI Tracer 拖出,不依赖越狱工具。
 - **导入**(左上角 + → 导入 Tracer):两种 —— 「从文件导入」(`ImportVC` 列 exportDir 里的 .json 点选)、「粘贴 JSON」(输入框)。都做校验:**解析失败或缺 module/start/end → 弹"配置格式无效"并中止**;通过则**重生 id、enabled=YES** 再加入 items,避免与现有条目冲突。
 - **兼容**:导入既接受 `{version,item}` 包装,也接受裸 item。

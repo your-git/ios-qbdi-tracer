@@ -5,6 +5,7 @@
  * item:  { id, enabled, traceName(可选), bundleId, appName, module, start, end, count,
  *          moduleOnly, delaySecs, logMask, maxInstructions(可选,0=不限制),
  *          triggerConsume: repeat|once|custom, triggers: [ trigger... ],
+ *          mutations: [ { enabled, offset, reg, width, value, apply } ],
  *          watches: [ watch... ] }
  * trigger: { triggerExpr, triggerAddress, triggerMatch, triggerValue,
  *            triggerWhere, triggerScan, triggerLimit }

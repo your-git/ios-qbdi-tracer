@@ -2,9 +2,11 @@
 #import "ConfigStore.h"
 #import "ExprInput.h"
 #import "HexValue.h"
+#import "MutationEditVC.h"
 #import "TriggerEditVC.h"
 #import "WatchEditVC.h"
 #import <objc/runtime.h>
+#include <stdint.h>
 
 #define TRACE_DEFAULT_LOGMASK 17
 #define TRACE_MIN_RANGE 0x10
@@ -16,6 +18,26 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
     NSInteger n = text.integerValue;
     if (value) *value = n;
     return n >= 1 && n <= 16;
+}
+
+static BOOL MutationRegValid(NSString *reg) {
+    if ([reg isEqual:@"fp"] || [reg isEqual:@"lr"]) return YES;
+    if (![reg hasPrefix:@"x"] || reg.length < 2) return NO;
+    NSString *digits = [reg substringFromIndex:1];
+    NSCharacterSet *bad = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    if (digits.length == 0 || [digits rangeOfCharacterFromSet:bad].location != NSNotFound) {
+        return NO;
+    }
+    NSInteger n = digits.integerValue;
+    return n >= 0 && n <= 28 && n != 17;
+}
+
+static NSString *MutationRegDisplay(NSDictionary *mutation) {
+    NSString *reg = mutation[@"reg"] ?: @"x0";
+    if ([mutation[@"width"] integerValue] == 32 && [reg hasPrefix:@"x"]) {
+        return [@"w" stringByAppendingString:[reg substringFromIndex:1]];
+    }
+    return reg;
 }
 
 @interface TraceFieldCell : UITableViewCell
@@ -89,26 +111,50 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
         if (trigger[@"triggerLimit"] == nil) trigger[@"triggerLimit"] = @1;
         if (trigger != nil) triggers[i] = trigger;
     }
+    if (![self.item[@"mutations"] isKindOfClass:[NSMutableArray class]]) {
+        NSArray *old = [self.item[@"mutations"] isKindOfClass:[NSArray class]]
+                           ? self.item[@"mutations"] : @[];
+        NSMutableArray *copy = [NSMutableArray array];
+        for (NSDictionary *entry in old) {
+            if ([entry isKindOfClass:[NSDictionary class]]) [copy addObject:[entry mutableCopy]];
+        }
+        self.item[@"mutations"] = copy;
+    }
+    NSMutableArray *mutations = self.item[@"mutations"];
+    for (NSUInteger i = 0; i < mutations.count; i++) {
+        NSMutableDictionary *mutation = [mutations[i] isKindOfClass:[NSMutableDictionary class]]
+                                            ? mutations[i] : [mutations[i] mutableCopy];
+        if (mutation == nil) continue;
+        if (mutation[@"enabled"] == nil) mutation[@"enabled"] = @YES;
+        if (mutation[@"reg"] == nil) mutation[@"reg"] = @"x0";
+        if (mutation[@"width"] == nil) mutation[@"width"] = @64;
+        if (mutation[@"apply"] == nil) mutation[@"apply"] = @"once";
+        mutation[@"offset"] = HexDisplay(mutation[@"offset"] ?: @"0x0");
+        mutation[@"value"] = HexDisplay(mutation[@"value"] ?: @"0x0");
+        mutations[i] = mutation;
+    }
     if (self.item[@"triggerConsume"] == nil) self.item[@"triggerConsume"] = @"repeat";
     [self beginEditingTarget:self.item];
 }
 
 - (NSSet<NSString *> *)snapshotExcludedKeys {
-    return [NSSet setWithObjects:@"watches", @"triggers", nil];
+    return [NSSet setWithObjects:@"watches", @"triggers", @"mutations", nil];
 }
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self.tableView reloadData];
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 5; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 6; }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    return @[ @"目标 App", @"模块与地址(十六进制)", @"选项", @"触发条件(可选)", @"监视(watch)" ][section];
+    return @[ @"目标 App", @"模块与地址(十六进制)", @"选项", @"触发条件(可选)",
+              @"Trace 内寄存器修改", @"监视(watch)" ][section];
 }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 1) return @"结束地址至少要比起始地址大 0x10。";
     if (section == 2) return @"Trace 次数允许 1–16 次。";
     if (section == 3) return @"没有条件时为无条件 Trace；有多条时，满足任意一条即可。相同判断地址共享一个 Hook。";
+    if (section == 4) return @"只改本次 QBDI Trace 的寄存器副本，不写回真实 App；规则在目标指令执行前生效。";
     return nil;
 }
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -116,6 +162,7 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
     if (section == 1) return 3;
     if (section == 2) return 3;
     if (section == 3) return (NSInteger)[self.item[@"triggers"] count] + 2;
+    if (section == 4) return (NSInteger)[self.item[@"mutations"] count] + 1;
     return (NSInteger)[self.item[@"watches"] count] + 1;
 }
 
@@ -195,6 +242,28 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
         }
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return c;
+    }
+    if (ip.section == 4) {
+        NSMutableArray *mutations = self.item[@"mutations"];
+        if (ip.row == (NSInteger)mutations.count) {
+            UITableViewCell *cell = [[UITableViewCell alloc]
+                initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            cell.textLabel.text = @"+ 添加寄存器修改";
+            cell.textLabel.textColor = [UIColor systemBlueColor];
+            return cell;
+        }
+        NSDictionary *mutation = mutations[ip.row];
+        UITableViewCell *cell = [[UITableViewCell alloc]
+            initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        cell.textLabel.text = [NSString stringWithFormat:@"%@ · %@ = %@",
+            mutation[@"offset"] ?: @"0x0", MutationRegDisplay(mutation),
+            mutation[@"value"] ?: @"0x0"];
+        NSString *apply = [mutation[@"apply"] isEqual:@"always"]
+                              ? @"每次命中" : @"每次 Trace 仅一次";
+        cell.detailTextLabel.text = [mutation[@"enabled"] boolValue]
+                                        ? apply : [@"已停用 · " stringByAppendingString:apply];
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return cell;
     }
     NSMutableArray *watches = self.item[@"watches"];
     if (ip.row == (NSInteger)watches.count) {
@@ -305,7 +374,24 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
         [self.navigationController pushViewController:vc animated:YES];
         return;
     }
-    if (ip.section != 4) return;
+    if (ip.section == 4) {
+        NSMutableArray *mutations = self.item[@"mutations"];
+        BOOL adding = ip.row == (NSInteger)mutations.count;
+        NSMutableDictionary *mutation = adding
+            ? [@{ @"enabled": @YES, @"offset": self.item[@"start"] ?: @"0x0",
+                   @"reg": @"x0", @"width": @64, @"value": @"0x0",
+                   @"apply": @"once" } mutableCopy]
+            : mutations[ip.row];
+        MutationEditVC *vc = [[MutationEditVC alloc] initWithMutation:mutation];
+        __weak typeof(self) weakSelf = self;
+        vc.onDone = ^{
+            if (adding) [mutations addObject:mutation];
+            [weakSelf.tableView reloadData];
+        };
+        [self.navigationController pushViewController:vc animated:YES];
+        return;
+    }
+    if (ip.section != 5) return;
     NSMutableArray *watches = self.item[@"watches"];
     BOOL adding = ip.row == (NSInteger)watches.count;
     NSMutableDictionary *watch = adding
@@ -322,7 +408,8 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
     NSMutableArray *array = nil;
     NSInteger index = -1;
     if (ip.section == 3) { array = self.item[@"triggers"]; index = ip.row - 1; }
-    else if (ip.section == 4) { array = self.item[@"watches"]; index = ip.row; }
+    else if (ip.section == 4) { array = self.item[@"mutations"]; index = ip.row; }
+    else if (ip.section == 5) { array = self.item[@"watches"]; index = ip.row; }
     if (index < 0 || index >= (NSInteger)array.count) return nil;
     __weak typeof(self) weakSelf = self;
     UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
@@ -378,6 +465,54 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
     return YES;
 }
 
+- (BOOL)validateMutations {
+    NSArray *mutations = self.item[@"mutations"];
+    for (NSUInteger i = 0; i < mutations.count; i++) {
+        NSDictionary *mutation = mutations[i];
+        if (![mutation[@"enabled"] boolValue]) continue;
+        unsigned long long offset = 0, value = 0;
+        if (!HexParseInput([mutation[@"offset"] description], &offset)) {
+            [self alert:@"寄存器修改地址无效"
+                message:[NSString stringWithFormat:@"第 %lu 条规则的静态地址无效。",
+                         (unsigned long)i + 1]];
+            return NO;
+        }
+        if (!HexParseInput([mutation[@"value"] description], &value)) {
+            [self alert:@"寄存器写入值无效"
+                message:[NSString stringWithFormat:@"第 %lu 条规则的写入值无效。",
+                         (unsigned long)i + 1]];
+            return NO;
+        }
+        NSString *reg = mutation[@"reg"];
+        NSInteger width = [mutation[@"width"] integerValue];
+        BOOL fixed64 = [reg isEqual:@"fp"] || [reg isEqual:@"lr"];
+        if (!MutationRegValid(reg) || (width != 32 && width != 64) ||
+            (fixed64 && width != 64)) {
+            [self alert:@"寄存器修改配置无效"
+                message:[NSString stringWithFormat:
+                    @"第 %lu 条规则的寄存器或位宽无效。",
+                    (unsigned long)i + 1]];
+            return NO;
+        }
+        if (width == 32 && value > UINT32_MAX) {
+            [self alert:@"寄存器写入值过大"
+                message:[NSString stringWithFormat:
+                    @"第 %lu 条规则使用 32 位寄存器，写入值不能超过 0xFFFFFFFF。",
+                    (unsigned long)i + 1]];
+            return NO;
+        }
+        NSString *apply = mutation[@"apply"];
+        if (![apply isEqual:@"once"] && ![apply isEqual:@"always"]) {
+            [self alert:@"寄存器修改配置无效"
+                message:[NSString stringWithFormat:@"第 %lu 条规则的应用方式无效。",
+                         (unsigned long)i + 1]];
+            return NO;
+        }
+        (void)offset;
+    }
+    return YES;
+}
+
 - (void)done {
     [self.view endEditing:YES];
     unsigned long long start = 0, end = 0;
@@ -392,6 +527,7 @@ static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
         [self alert:@"Trace 次数无效" message:@"Trace 次数必须是 1–16 的整数。"]; return;
     }
     if (![self validateTriggersWithStart:start end:end]) return;
+    if (![self validateMutations]) return;
     ConfigStore *store = [ConfigStore shared];
     BOOL appended = self.isNew;
     if (appended) [store.items addObject:self.item];

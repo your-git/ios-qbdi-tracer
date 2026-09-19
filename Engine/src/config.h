@@ -27,6 +27,15 @@ typedef enum {
     TRIG_CONSUME_CUSTOM,
 } TrigConsumePolicy;
 
+/* 只作用于一次 QBDI 执行的寄存器覆盖规则。Trace 结束后寄存器现场会恢复。 */
+typedef struct {
+    uint64_t offset;      /* 当前 trace 模块的静态偏移，命中指令执行前生效 */
+    uint64_t value;
+    uint8_t  reg_index;   /* 0..28=x0..x28, 29=fp, 30=lr；x17 禁止配置 */
+    uint8_t  width;       /* 32=按 wN 写入并清零高位，64=按 xN 写入 */
+    uint8_t  every_hit;   /* 0=每次 Trace 仅第一次命中生效，1=每次命中 */
+} TraceMutation;
+
 #define TRIG_MAX_BYTES 32     /* 期望值最长 32 字节 */
 #define TRIG_MAX_SCAN  0x1000 /* 「包含」的搜索窗口硬上限 4KB */
 #define TRIG_DEF_SCAN  0x100  /* 默认窗口 256 字节 */
@@ -63,6 +72,9 @@ typedef struct {
     TraceTrigger *triggers;                      /* 0 条 = 无条件 */
     int           trigger_count;                 /* 条件数量不设产品层上限 */
     TrigConsumePolicy trigger_policy;
+
+    TraceMutation *mutations;                    /* 仅改变 QBDI 寄存器状态 */
+    int            mutation_count;
 } TraceSpec;
 
 typedef struct {

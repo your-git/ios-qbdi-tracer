@@ -34,6 +34,7 @@
 | `src/AppPickerVC.m` | 141 | 应用选择器。`LSApplicationWorkspace`(私有 API)列所有 app 图标+名字+bundleId,带搜索 |
 | `src/TraceEditVC.m` | ~400 | trace 表单。恢复 1–16 次；触发条件为不限数量的子表，含 repeat/once/custom 消耗策略和地址间距校验 |
 | `src/TriggerEditVC.m` | ~350 | 单条触发条件编辑页；custom 下显示 1–16 的触发次数上限，并负责表达式、地址、匹配与期望值校验 |
+| `src/MutationEditVC.m` | ~300 | Trace 内寄存器修改编辑页：地址、寄存器、32/64 位、值、once/always；不提供内存写入 |
 | `src/WatchEditVC.m` | ~217 | watch 表单。寄存器/action 用 action sheet;寄存器那栏顶部的「✎ 输入取址表达式…」走 `ExprInput` 的弹窗;size 走 `HexValue` |
 | `src/ImportVC.m` | ~110 | **从文件导入**列表页。列 exportDir 里的 .json,点选 → 校验 → 加入 items |
 | `Resources/Info.plist` | - | **必须在 Resources/**,否则图标不出现。bundleId=`com.snk.qbditracer`。含 `UIFileSharingEnabled`+`LSSupportsOpeningDocumentsInPlace`(导出文件供 Finder 文件共享取出) |
@@ -98,6 +99,22 @@
 命中后用按条件数量分配的线程局部状态授权同线程下一次 start，不要改成全局 bool。
 
 改完跑 `./scripts/test_watch_expr.sh` 的第 4 组,它会验证解析结果和 `trig_compare` 的语义。
+
+### A5. 改 Trace 内寄存器修改
+
+配置位于 item 级 `mutations` 数组。修改时同步检查：
+
+1. `Engine/src/config.h` 的 `TraceMutation`
+2. `Engine/src/engine.m` 的 `load_mutations`（加载期严格校验）
+3. `Engine/src/qbdi_trace.c` 的 `mutation_handle`（`QBDI_PREINST`，同地址按数组顺序）
+4. `GUI/src/MutationEditVC.m` 和 `TraceEditVC.m`
+5. `GUI/src/ConfigStore.m` 的加载、创建、导入深拷，以及 `RootListVC.m` 的复制
+
+边界不可随意放宽：仅支持 `x0..x28`（排除 Dobby 使用的 `x17`）、`fp`、`lr`；
+不支持 `sp/pc`，也不写真实内存。32 位写入按 AArch64 `wN` 语义清零高 32 位。
+规则在目标指令执行前生效，所以覆盖 load 或 call 的结果必须选下一条指令。`once` 是
+每次 Trace 首次命中，`always` 是每次命中。完整命中写文件，控制台只报每条规则首次，
+避免热循环刷爆 Console。改完跑本机测试第 5 组。
 
 ### B. 改注入范围
 

@@ -1,5 +1,28 @@
 #import "ConfigStore.h"
 
+/* 旧 JSON 没有 mutations 时返回空数组；字段补默认值只为 GUI 可编辑性，
+ * 最终的严格合法性仍由编辑页和引擎各自校验。 */
+static NSMutableArray *mutableMutations(id raw) {
+    NSMutableArray *result = [NSMutableArray array];
+    if (![raw isKindOfClass:[NSArray class]]) return result;
+    for (NSDictionary *entry in raw) {
+        if (![entry isKindOfClass:[NSDictionary class]]) continue;
+        NSMutableDictionary *copy = [entry mutableCopy];
+        if (copy[@"enabled"] == nil) copy[@"enabled"] = @YES;
+        if (copy[@"reg"] == nil) copy[@"reg"] = @"x0";
+        if (copy[@"width"] == nil) copy[@"width"] = @64;
+        if (copy[@"apply"] == nil) copy[@"apply"] = @"once";
+        for (NSString *key in @[ @"offset", @"value" ]) {
+            if ([copy[key] isKindOfClass:[NSNumber class]]) {
+                copy[key] = [NSString stringWithFormat:@"0x%llx",
+                             [copy[key] unsignedLongLongValue]];
+            }
+        }
+        [result addObject:copy];
+    }
+    return result;
+}
+
 @implementation ConfigStore
 
 + (instancetype)shared {
@@ -58,6 +81,7 @@
                     }
                 }
                 m[@"watches"] = mw;
+                m[@"mutations"] = mutableMutations(it[@"mutations"]);
                 /* triggers 深拷；旧版扁平触发字段迁移成一条，未配置则保持空数组。 */
                 NSMutableArray *mt = [NSMutableArray array];
                 NSArray *triggers = it[@"triggers"];
@@ -142,6 +166,7 @@
         @"maxInstructions": @0,  /* 0=精确跑到 end，不按指令数截断 */
         @"triggerConsume": @"repeat",
         @"triggers": [NSMutableArray array],
+        @"mutations": [NSMutableArray array],
         @"watches": [NSMutableArray array],
     } mutableCopy];
 }
@@ -287,6 +312,7 @@ static NSString *sanitizeName(NSString *s) {
         }
     }
     out[@"watches"] = mw;
+    out[@"mutations"] = mutableMutations(item[@"mutations"]);
     NSMutableArray *mt = [NSMutableArray array];
     if ([item[@"triggers"] isKindOfClass:[NSArray class]]) {
         for (NSDictionary *tr in item[@"triggers"]) {

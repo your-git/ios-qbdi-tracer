@@ -62,7 +62,9 @@ static __thread ThreadTriggerState *g_thread_triggers;
 static __thread unsigned int g_inside_qbdi_trace;
 
 typedef struct {
+    const TraceSpec *spec;
     const char *module;
+    int trace_no;
     uint64_t mask;
     uint64_t module_base;
     uint64_t static_start;
@@ -74,6 +76,7 @@ typedef struct {
     uint64_t next_progress;
     uint64_t stop_pc; /* 被指令上限拦下的下一条指令 */
     bool instruction_limit_reached;
+    uint64_t *mutation_hits; /* 每条规则在本次 Trace 中的成功应用次数 */
     uint64_t prev[32]; /* x0..x28, fp, lr, sp 寄存器增量对比 */
     __uint128_t prev_v[32]; /* v0..v31 向量寄存器增量对比(仅 LOG_VREG 时用) */
     int has_prev;
@@ -92,6 +95,66 @@ static const char *const g_vreg_names[32] = {
     "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
     "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
 };
+
+static uint64_t *mutation_reg_slot(GPRState *gpr, uint8_t index) {
+    if (gpr == NULL) return NULL;
+    if (index <= 28) return &((uint64_t *)gpr)[index];
+    if (index == 29) return &gpr->x29;
+    if (index == 30) return &gpr->lr;
+    return NULL;
+}
+
+static void mutation_reg_name(const TraceMutation *mutation, char *buf,
+                              size_t cap) {
+    if (mutation->reg_index <= 28) {
+        snprintf(buf, cap, "%c%u", mutation->width == 32 ? 'w' : 'x',
+                 (unsigned)mutation->reg_index);
+    } else {
+        snprintf(buf, cap, "%s", mutation->reg_index == 29 ? "fp" : "lr");
+    }
+}
+
+/* PREINST 阶段只改 QBDI 的 GPRState。自动 Hook 返回时 trace_ctx_entry 会恢复
+ * 原始现场，因此这里不会把寄存器值带回真实 App。相同地址的规则按数组顺序执行。 */
+static int mutation_handle(TraceCtx *ctx, GPRState *gpr, uint64_t rel) {
+    if (ctx->spec == NULL || ctx->mutation_hits == NULL || gpr == NULL) return 0;
+    int applied = 0;
+    for (int i = 0; i < ctx->spec->mutation_count; i++) {
+        const TraceMutation *mutation = &ctx->spec->mutations[i];
+        if (mutation->offset != rel) continue;
+        if (!mutation->every_hit && ctx->mutation_hits[i] != 0) continue;
+
+        uint64_t *slot = mutation_reg_slot(gpr, mutation->reg_index);
+        if (slot == NULL) continue; /* 配置层已校验；保留运行时防御 */
+        uint64_t old_value = *slot;
+        uint64_t new_value = mutation->width == 32
+                                 ? (uint64_t)(uint32_t)mutation->value
+                                 : mutation->value;
+        *slot = new_value;
+        uint64_t hit = ++ctx->mutation_hits[i];
+        char reg[8];
+        mutation_reg_name(mutation, reg, sizeof(reg));
+        fprintf(ctx->out,
+                "[mutation %s+0x%llx] trace#%d rule#%d hit#%llu %s: "
+                "0x%llx -> 0x%llx apply=%s scope=trace-only\n",
+                ctx->module, (unsigned long long)rel, ctx->trace_no, i + 1,
+                (unsigned long long)hit, reg, (unsigned long long)old_value,
+                (unsigned long long)new_value,
+                mutation->every_hit ? "always" : "once");
+        /* always 可能位于热循环；控制台仅报告每条规则首次生效，完整命中留在文件。 */
+        if (hit == 1) {
+            qbdi_console_logf(
+                "[%s] trace#%d mutation rule#%d applied at 0x%llx: %s "
+                "0x%llx -> 0x%llx (%s, trace-only)",
+                ctx->module, ctx->trace_no, i + 1, (unsigned long long)rel,
+                reg, (unsigned long long)old_value,
+                (unsigned long long)new_value,
+                mutation->every_hit ? "every-hit" : "once");
+        }
+        applied++;
+    }
+    return applied;
+}
 
 /* 把 128 位向量寄存器格式化成 "0x<高64><低64>" 写进日志 */
 static void print_vreg(FILE *out, const char *name, __uint128_t v) {
@@ -816,6 +879,10 @@ static VMAction inst_cb(VMInstanceRef vm, GPRState *gpr, FPRState *fpr,
         rel = ia->address - c->module_base;
     }
 
+    /* 必须早于指令日志和 watch：同一行寄存器快照及同地址监视看到的都是
+     * 覆盖后的值，随后本条指令也以该值执行。 */
+    if (mutation_handle(c, gpr, rel) > 0) fflush(c->out);
+
     if (c->mask & LOG_INST) {
         /* 当前寄存器快照(x0..x28, fp, lr, sp) */
         uint64_t cur[32];
@@ -1126,7 +1193,9 @@ static bool run_trace(const TraceSpec *spec, uint64_t base, void *origin,
 
     TraceCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
+    ctx.spec         = spec;
     ctx.module       = spec->module;
+    ctx.trace_no     = no;
     ctx.mask         = mask;
     ctx.module_base  = base;
     ctx.static_start = spec->static_start;
@@ -1135,6 +1204,18 @@ static bool run_trace(const TraceSpec *spec, uint64_t base, void *origin,
     ctx.max_instructions = spec->max_instructions;
     ctx.end = end;
     ctx.next_progress = TRACE_PROGRESS_INTERVAL;
+    if (spec->mutation_count > 0) {
+        ctx.mutation_hits = calloc((size_t)spec->mutation_count,
+                                   sizeof(*ctx.mutation_hits));
+        if (ctx.mutation_hits == NULL) {
+            qbdi_trace_logf("[%s] trace#%d step: mutation state allocation FAILED\n",
+                            spec->module, no);
+            qbdi_alignedFree(fakestack);
+            qbdi_terminateVM(vm);
+            pthread_mutex_unlock(&g_trace_lock);
+            return false;
+        }
+    }
     qbdi_addCodeCB(vm, QBDI_PREINST, inst_cb, &ctx, 0);
 
     qbdi_trace_logf("[%s] trace#%d step: set regs, entry=%p end=0x%llx\n",
@@ -1216,6 +1297,22 @@ static bool run_trace(const TraceSpec *spec, uint64_t base, void *origin,
     }
     bool completed = ok && !ctx.instruction_limit_reached && state->pc == end;
 
+    for (int i = 0; i < spec->mutation_count; i++) {
+        uint64_t hits = ctx.mutation_hits != NULL ? ctx.mutation_hits[i] : 0;
+        fprintf(out,
+                "[%s] trace#%d mutation rule#%d summary: hits=%llu offset=0x%llx\n",
+                spec->module, no, i + 1, (unsigned long long)hits,
+                (unsigned long long)spec->mutations[i].offset);
+        if (hits == 0) {
+            qbdi_console_logf(
+                "[%s] trace#%d mutation rule#%d NOT APPLIED: address "
+                "0x%llx was not executed before trace stopped",
+                spec->module, no, i + 1,
+                (unsigned long long)spec->mutations[i].offset);
+        }
+    }
+    if (spec->mutation_count > 0) fflush(out);
+    free(ctx.mutation_hits);
     if (fakestack != NULL) {
         qbdi_alignedFree(fakestack);
     }
