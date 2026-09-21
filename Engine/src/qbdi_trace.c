@@ -3,11 +3,13 @@
 
 #include "qbdi_trace.h"
 
+#include <errno.h>
 #include <mach/mach.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <os/log.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -22,11 +24,19 @@
 
 #include "config.h" /* find_module / g_traces / g_watches */
 
-/* 日志文件:/tmp/qbdi_trace_<年月日时分>.log
- * 文件名在进程首次写日志时按当前时间生成一次(配置靠"重开 app"生效,
- * 所以每次 app 启动 = 一个新的带时间戳日志)。 */
-#define TRACE_LOG_DIR    "/tmp"
-#define TRACE_LOG_PREFIX "qbdi_trace_"
+/* 日志文件:<logRoot>/trace-logs/trace_<年月日时分>.log
+ *
+ * logRoot 由 settings.json 配置(用户可在 App 的设置页改),引擎在读完
+ * settings.json 后用 qbdi_trace_set_log_root() 告知;没设置过就用默认值。
+ *
+ * 时间戳在进程首次要用它时生成一次,之后全进程复用 —— **Trace 日志和
+ * Hook 日志必须共享同一个时间戳**,否则同一次运行产生的两份日志对不上号。
+ * 年份只取两位(26 而非 2026)。
+ *
+ * 子目录名要与 GUI/src/AppSettings.h 里的 QBDI_*_LOG_SUBDIR 保持一致。 */
+#define TRACE_LOG_ROOT_DEFAULT "/tmp/ios-qbdi-tracer"
+#define TRACE_LOG_SUBDIR       "trace-logs"
+#define TRACE_LOG_PREFIX       "trace_"
 #define TRACE_STACK_SIZE 0x100000
 /* hexdump 的硬上限:size 配大了(hex 输入很容易多打一个 0)也不会把日志写爆 */
 #define WATCH_HEXDUMP_MAX 0x10000
@@ -197,22 +207,69 @@ void qbdi_console_logf(const char *fmt, ...) {
     va_end(ap);
 }
 
+/* 日志根目录。engine.m 读完 settings.json 后覆盖;缺省即出厂值。
+ * 只在 engine_start 早期写一次、之后只读,所以不需要额外加锁。 */
+static char g_log_root[512] = TRACE_LOG_ROOT_DEFAULT;
+
+void qbdi_trace_set_log_root(const char *root) {
+    if (root == NULL || root[0] != '/') {
+        return; /* 非绝对路径一律忽略,继续用当前值 */
+    }
+    snprintf(g_log_root, sizeof(g_log_root), "%s", root);
+}
+
+/* 全进程共享的时间戳(年月日时分,年份两位)。Trace 与 Hook 日志都用它,
+ * 这样同一次运行的两份日志文件名后缀完全一致。 */
+static char g_log_stamp[16];
+static void log_stamp_init(void) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    strftime(g_log_stamp, sizeof(g_log_stamp), "%y%m%d%H%M", &tm);
+}
+static pthread_once_t g_log_stamp_once = PTHREAD_ONCE_INIT;
+
+const char *qbdi_log_timestamp(void) {
+    pthread_once(&g_log_stamp_once, log_stamp_init);
+    return g_log_stamp;
+}
+
+/* mkdir -p。逐级建,已存在(EEXIST)不算失败。 */
+static bool ensure_dir(const char *path) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char *p = buf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+            return false;
+        }
+        *p = '/';
+    }
+    return mkdir(buf, 0755) == 0 || errno == EEXIST;
+}
+
+/* 拼出 <logRoot>/<subdir>/<prefix><时间戳>.log,顺带把目录建出来。
+ * Hook 日志(阶段②)复用同一套,只换 subdir 和 prefix。 */
+void qbdi_log_build_path(char *out, size_t cap, const char *subdir,
+                         const char *prefix) {
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/%s", g_log_root, subdir);
+    if (!ensure_dir(dir)) {
+        qbdi_console_logf("log dir create FAILED: %s (errno=%d)", dir, errno);
+    }
+    snprintf(out, cap, "%s/%s%s.log", dir, prefix, qbdi_log_timestamp());
+}
+
 static FILE *trace_log_open(void) {
     if (g_log == NULL) {
-        char path[256];
-        time_t now = time(NULL);
-        struct tm tm;
-        localtime_r(&now, &tm);
-        char ts[16];
-        /* 年月日时分:YYYYMMDDHHMM */
-        strftime(ts, sizeof(ts), "%Y%m%d%H%M", &tm);
-        snprintf(path, sizeof(path), "%s/%s%s.log", TRACE_LOG_DIR,
-                 TRACE_LOG_PREFIX, ts);
+        char path[640];
+        qbdi_log_build_path(path, sizeof(path), TRACE_LOG_SUBDIR, TRACE_LOG_PREFIX);
         g_log = fopen(path, "a");
         if (g_log != NULL) {
             qbdi_console_logf("trace log opened: %s", path);
         } else {
-            qbdi_console_logf("trace log open FAILED: %s", path);
+            qbdi_console_logf("trace log open FAILED: %s (errno=%d)", path, errno);
         }
     }
     return g_log;

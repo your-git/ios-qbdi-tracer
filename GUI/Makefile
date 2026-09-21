@@ -5,10 +5,11 @@ include $(THEOS)/makefiles/common.mk
 
 APPLICATION_NAME = TracerGUI
 
-TracerGUI_FILES = entry.m src/AppDelegate.m src/ConfigStore.m \
+TracerGUI_FILES = entry.m src/AppDelegate.m src/AppSettings.m src/ConfigStore.m \
                   src/NavController.m src/FormEditVC.m \
                   src/ExprInput.m src/HexValue.m \
-                  src/RootListVC.m src/AppPickerVC.m \
+                  src/MoreMenu.m src/SettingsVC.m \
+                  src/RootListVC.m src/HookListVC.m src/AppPickerVC.m \
                   src/TraceEditVC.m src/TriggerEditVC.m src/MutationEditVC.m \
                   src/WatchEditVC.m src/ImportVC.m
 TracerGUI_FRAMEWORKS = UIKit Foundation

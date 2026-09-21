@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h> /* size_t:qbdi_log_build_path */
 #include <stdint.h>
 
 /* 日志位 */
@@ -59,6 +60,24 @@ uint64_t trace(const char *module, uint64_t static_start, uint64_t static_end,
 /* trampoline → trace 的入参通道(手动路径用,线程局部) */
 extern __thread uint64_t g_enter_args[8];
 extern __thread void *g_enter_origin;
+
+/* ---- 日志落地位置 ----
+ *
+ * 目录结构:<logRoot>/trace-logs/trace_<年月日时分>.log
+ *           <logRoot>/hook-logs/hook_<年月日时分>.log(阶段② Hook 用)
+ *
+ * logRoot 来自 settings.json(用户可在 App 设置页改)。engine_start 必须在
+ * **第一次写文件日志之前**调用 qbdi_trace_set_log_root,否则日志会落到默认
+ * 的 /tmp/ios-qbdi-tracer 而不是用户配的位置。非绝对路径会被忽略。 */
+void qbdi_trace_set_log_root(const char *root);
+
+/* 全进程共享的日志时间戳(%y%m%d%H%M)。首次调用时生成,之后恒定 ——
+ * Trace 和 Hook 日志靠它保证同一次运行的文件名后缀一致。 */
+const char *qbdi_log_timestamp(void);
+
+/* 拼 <logRoot>/<subdir>/<prefix><时间戳>.log 并按需创建目录。 */
+void qbdi_log_build_path(char *out, size_t cap, const char *subdir,
+                         const char *prefix);
 
 /* 追加日志(自动 hook 的安装/报错信息) */
 void qbdi_trace_logf(const char *fmt, ...);

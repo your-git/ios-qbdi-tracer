@@ -39,19 +39,36 @@ bool find_module(const char *name, uint64_t *runtime_base) {
     return false;
 }
 
-/* 配置文件路径:优先 rootless 前缀 /var/jb,回退经典路径 */
-static NSString *config_path(void) {
+/* 配置目录:优先 rootless 前缀 /var/jb,回退经典路径。
+ * 目录下现在有三份文件:settings.json(总开关+路径)、config.json(trace)、
+ * hooks.json(hook,阶段②引入)。挑目录时以 name 这一份是否存在为准。 */
+static NSString *config_file(NSString *name) {
     NSArray *bases = @[ @"/var/jb/var/mobile/Documents/QBDITracer",
                         @"/var/mobile/Documents/QBDITracer" ];
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *b in bases) {
-        NSString *p = [b stringByAppendingPathComponent:@"config.json"];
+        NSString *p = [b stringByAppendingPathComponent:name];
         if ([fm fileExistsAtPath:p]) {
             return p;
         }
     }
     /* 默认返回经典路径(供日志说明) */
-    return [bases.lastObject stringByAppendingPathComponent:@"config.json"];
+    return [bases.lastObject stringByAppendingPathComponent:name];
+}
+
+static NSString *config_path(void) {
+    return config_file(@"config.json");
+}
+
+/* 读一份 JSON 字典;文件不存在或内容不是对象都返回 nil。 */
+static NSDictionary *read_json_dict(NSString *path) {
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (data == nil) {
+        return nil;
+    }
+    NSDictionary *d =
+        [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [d isKindOfClass:[NSDictionary class]] ? d : nil;
 }
 
 /* "0x1234" / "1234"(hex) → uint64。空/非法返回 0 */
@@ -748,22 +765,43 @@ void engine_start(void) {
                           bundleId.UTF8String ?: "(unknown)",
                           [[NSProcessInfo processInfo] processIdentifier]);
 
+        /* settings.json 先读:总开关关着就立刻返回,另外两份配置根本不用碰。
+         * 它还带着日志根目录,必须在任何文件日志产生之前设好。 */
+        NSDictionary *settings = read_json_dict(config_file(@"settings.json"));
+
         NSString *path = config_path();
         NSData *data = [NSData dataWithContentsOfFile:path];
-        if (data == nil) {
-            return; /* 无配置:空转返回(全量注入的其它 app 走这里) */
-        }
         NSError *jsonError = nil;
-        NSDictionary *cfg =
-            [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
-        if (![cfg isKindOfClass:[NSDictionary class]]) {
-            qbdi_console_logf("config load failed: path=%s error=%s",
-                              path.UTF8String,
-                              jsonError.localizedDescription.UTF8String ?: "invalid root object");
-            return;
+        NSDictionary *cfg = nil;
+        if (data != nil) {
+            cfg = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+            if (![cfg isKindOfClass:[NSDictionary class]]) {
+                qbdi_console_logf("config load failed: path=%s error=%s",
+                                  path.UTF8String,
+                                  jsonError.localizedDescription.UTF8String ?: "invalid root object");
+                return;
+            }
         }
-        if (!parse_bool(cfg[@"enabled"], true)) {
-            return; /* 总开关关闭 */
+
+        if (settings != nil) {
+            id root = settings[@"logRoot"];
+            if ([root isKindOfClass:[NSString class]] && [root length] > 0) {
+                qbdi_trace_set_log_root([root UTF8String]);
+            }
+            if (!parse_bool(settings[@"enabled"], true)) {
+                return; /* 总开关关闭 */
+            }
+        } else {
+            /* settings.json 还不存在 = 用户升级后还没打开过控制 App。此时总开关
+             * 仍在旧 config.json 里,必须回落去读它 —— 否则"原本关掉的插件"会
+             * 在这段窗口期自己变成开启。App 首次启动会把它迁到 settings.json。 */
+            if (cfg != nil && !parse_bool(cfg[@"enabled"], true)) {
+                return;
+            }
+        }
+
+        if (cfg == nil) {
+            return; /* 无 trace 配置:空转返回(全量注入的其它 app 走这里) */
         }
         NSArray *items = cfg[@"items"];
         if (![items isKindOfClass:[NSArray class]] || items.count == 0) {

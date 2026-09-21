@@ -30,9 +30,11 @@
     titleForFooterInSection:(NSInteger)s {
     if (self.files.count == 0) {
         return @"目录为空。可用 Finder 连接手机 → 文件共享 → QBDI Tracer,"
-               @"把导出的 .json 放进来;或用「粘贴 JSON」导入。";
+               @"把导出的 .json 放进来;或用「粘贴 JSON」导入。\n\n"
+               @"导出目录可在「更多 → 设置」里修改。";
     }
-    return nil;
+    /* 旧版导出文件直接堆在 Documents 根下,升级后也一并列出,不然用户会以为丢了。 */
+    return @"同时列出了旧版散落在 Documents 根目录下的导出文件。";
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {

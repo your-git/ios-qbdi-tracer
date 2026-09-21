@@ -1,5 +1,7 @@
 #import "ConfigStore.h"
 
+#import "AppSettings.h"
+
 /* 旧 JSON 没有 mutations 时返回空数组；字段补默认值只为 GUI 可编辑性，
  * 最终的严格合法性仍由编辑页和引擎各自校验。 */
 static NSMutableArray *mutableMutations(id raw) {
@@ -37,12 +39,7 @@ static NSMutableArray *mutableMutations(id raw) {
 
 /* 配置目录:rootless 优先 /var/jb,否则经典路径。与引擎 config_path() 保持一致。 */
 - (NSString *)configDir {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    if ([fm fileExistsAtPath:@"/var/jb" isDirectory:&isDir] && isDir) {
-        return @"/var/jb/var/mobile/Documents/QBDITracer";
-    }
-    return @"/var/mobile/Documents/QBDITracer";
+    return QBDIConfigDir();
 }
 
 - (NSString *)configPath {
@@ -50,7 +47,6 @@ static NSMutableArray *mutableMutations(id raw) {
 }
 
 - (void)load {
-    self.enabled = YES;
     self.items = [NSMutableArray array];
 
     NSData *data = [NSData dataWithContentsOfFile:[self configPath]];
@@ -62,9 +58,7 @@ static NSMutableArray *mutableMutations(id raw) {
     if (![cfg isKindOfClass:[NSDictionary class]]) {
         return;
     }
-    id en = cfg[@"enabled"];
-    self.enabled = [en isKindOfClass:[NSNumber class]] ? [en boolValue] : YES;
-
+    /* cfg[@"enabled"] 是旧版总开关,已由 AppSettings 迁到 settings.json,这里忽略。 */
     NSArray *items = cfg[@"items"];
     if ([items isKindOfClass:[NSArray class]]) {
         for (NSDictionary *it in items) {
@@ -135,8 +129,7 @@ static NSMutableArray *mutableMutations(id raw) {
                    attributes:nil
                         error:&err];
 
-    NSDictionary *cfg = @{ @"enabled": @(self.enabled),
-                           @"items": self.items ?: @[] };
+    NSDictionary *cfg = @{ @"items": self.items ?: @[] };
     if (![NSJSONSerialization isValidJSONObject:cfg]) {
         return NO;
     }
@@ -180,28 +173,7 @@ static NSError *cfgError(NSString *msg) {
 }
 
 - (NSString *)exportDir {
-    /* App 沙盒 Documents;系统级 app 上 NSHomeDirectory 可能非标准沙盒,
-     * 探测失败则回退到 Finder/文件 App 可见的固定位置。 */
-    NSString *dir = nil;
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES);
-    if (paths.count > 0) {
-        dir = paths.firstObject;
-    }
-    if (dir.length == 0) {
-        NSString *home = NSHomeDirectory();
-        if (home.length) {
-            dir = [home stringByAppendingPathComponent:@"Documents"];
-        }
-    }
-    if (dir.length == 0) {
-        dir = @"/var/mobile/Documents"; /* 最后兜底 */
-    }
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:nil];
-    return dir;
+    return [[AppSettings shared] traceExportDir];
 }
 
 /* 文件名净化:去掉路径分隔符和空白,保证是合法文件名 */
@@ -238,7 +210,7 @@ static NSString *sanitizeName(NSString *s) {
     NSDateFormatter *df = [NSDateFormatter new];
     df.dateFormat = @"yyyyMMddHHmm";
     NSString *ts = [df stringFromDate:[NSDate date]];
-    NSString *fname = [NSString stringWithFormat:@"%@%@.json",
+    NSString *fname = [NSString stringWithFormat:@"trace_%@%@.json",
                        sanitizeName(appName), ts];
     NSString *path = [[self exportDir] stringByAppendingPathComponent:fname];
 
@@ -250,12 +222,20 @@ static NSString *sanitizeName(NSString *s) {
 }
 
 - (NSArray<NSString *> *)listImportableFiles {
-    NSString *dir = [self exportDir];
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *names = [fm contentsOfDirectoryAtPath:dir error:nil];
     NSMutableArray *paths = [NSMutableArray array];
-    for (NSString *n in names) {
-        if ([n.pathExtension.lowercaseString isEqualToString:@"json"]) {
+    /* 旧版把导出文件直接堆在 Documents 根下。升级后仍然列出来,否则用户会以为
+     * 以前导出的配置丢了。同名文件以新目录为准。 */
+    NSMutableArray<NSString *> *dirs = [NSMutableArray arrayWithObject:[self exportDir]];
+    NSString *legacy = QBDIDocumentsDir();
+    if (legacy.length && ![dirs containsObject:legacy]) [dirs addObject:legacy];
+
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (NSString *dir in dirs) {
+        for (NSString *n in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+            if (![n.pathExtension.lowercaseString isEqualToString:@"json"]) continue;
+            if ([seen containsObject:n]) continue;
+            [seen addObject:n];
             [paths addObject:[dir stringByAppendingPathComponent:n]];
         }
     }

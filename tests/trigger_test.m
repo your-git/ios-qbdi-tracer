@@ -223,7 +223,7 @@ int main(void) {
         puts("\n-- 每条条件的自定义触发次数上限 --");
         {
             TraceTrigger t; memset(&t, 0, sizeof(t)); char err[96] = "";
-            if (load_trigger(@{ @"triggerExpr": @"[x0]", @"triggerLimit": @16 },
+            if (load_trigger((@{ @"triggerExpr": @"[x0]", @"triggerLimit": @16 }),
                              &t, err, sizeof(err)) && t.max_traces == 16) {
                 puts("ok   triggerLimit=16");
             } else {
@@ -233,7 +233,7 @@ int main(void) {
         }
         for (NSNumber *bad in @[ @0, @17 ]) {
             TraceTrigger t; memset(&t, 0, sizeof(t)); char err[96] = "";
-            if (!load_trigger(@{ @"triggerExpr": @"[x0]", @"triggerLimit": bad },
+            if (!load_trigger((@{ @"triggerExpr": @"[x0]", @"triggerLimit": bad }),
                               &t, err, sizeof(err))) {
                 printf("ok   拒绝 triggerLimit=%d:%s\n", bad.intValue, err);
             } else {
