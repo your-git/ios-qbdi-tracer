@@ -8,6 +8,7 @@
 
 #import "config.h"
 #import "engine.h"
+#import "hook.h"
 
 /* ---- 运行期配置表(config.h 中 extern) ---- */
 TraceSpec  g_traces[TRACE_MAX_TARGETS];
@@ -17,7 +18,11 @@ int        g_watch_count = 0;
 
 /* 已成功安装的 Dobby 补丁绝对地址。配置中的模块名是子串，两个不同字符串
  * 也可能匹配到同一镜像，所以装 Hook 前还要用绝对地址再挡一道。 */
-static uint64_t g_installed_hook_targets[TRACE_MAX_TARGETS + TRACE_MAX_TRIGGER_HOOKS];
+/* 已装 Dobby 补丁的绝对地址。Trace 的 start/trigger 和 Hook 的 target 共用这张
+ * 表 —— 它们在同一进程里,两个补丁靠得太近(<0x10)会互相踩坏,与类型无关。 */
+static uint64_t g_installed_hook_targets[TRACE_MAX_TARGETS +
+                                         TRACE_MAX_TRIGGER_HOOKS +
+                                         HOOK_MAX_TARGETS];
 static int g_installed_hook_count;
 static int g_trigger_hook_count;
 
@@ -751,58 +756,213 @@ static void install_slot(int slot) {
     }
 }
 
-void engine_start(void) {
-    @autoreleasepool {
-        NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
-        /* 控制 App 自己不 hook */
-        if (bundleId != nil && [bundleId isEqualToString:GUI_BUNDLE_ID]) {
-            return;
+/* ===== Hook 加载与安装(hooks.json) ===== */
+
+static const char *hook_val_type_name(HookValType t) {
+    return t == HOOK_VAL_BYTES ? "bytes"
+         : t == HOOK_VAL_STRING ? "string" : "number";
+}
+
+/* 解析一条"修改数据"。失败返回 false + err(调用方拒整条 Hook)。 */
+static bool load_hook_mod(NSDictionary *src, HookMod *m, char *err, size_t errcap) {
+    memset(m, 0, sizeof(*m));
+    if (![src isKindOfClass:[NSDictionary class]]) {
+        snprintf(err, errcap, "mod 不是对象");
+        return false;
+    }
+    /* kind:目前只支持 modify;read(读取数据)研发中,不该出现在配置里 */
+    NSString *kind = src[@"kind"];
+    if ([kind isKindOfClass:[NSString class]] && [kind length] > 0 &&
+        ![kind isEqualToString:@"modify"]) {
+        snprintf(err, errcap, "不支持的功能 kind=\"%s\"", [kind UTF8String]);
+        return false;
+    }
+
+    NSString *typeStr = [src[@"type"] isKindOfClass:[NSString class]]
+                            ? src[@"type"] : @"number";
+    HookValType type;
+    if ([typeStr isEqualToString:@"bytes"]) type = HOOK_VAL_BYTES;
+    else if ([typeStr isEqualToString:@"string"]) type = HOOK_VAL_STRING;
+    else if ([typeStr isEqualToString:@"number"]) type = HOOK_VAL_NUMBER;
+    else { snprintf(err, errcap, "未知修改类型 \"%s\"", [typeStr UTF8String]); return false; }
+
+    /* 位宽只对 number 有意义;其余给个占位值。 */
+    uint8_t width = 0;
+    if (type == HOOK_VAL_NUMBER) width = (uint8_t)parse_int(src[@"width"], 64);
+
+    NSString *value = [src[@"value"] isKindOfClass:[NSString class]]
+                          ? src[@"value"] : @"";
+    if (!hook_encode_value(m, type, width, [value UTF8String], err, errcap)) {
+        return false;
+    }
+
+    NSString *expr = [src[@"expr"] isKindOfClass:[NSString class]] ? src[@"expr"] : @"";
+    /* classify 前先按类型定好 m->type(encode 已设),它决定不对称语义走向。 */
+    if (!hook_classify_target(m, [expr UTF8String], err, errcap)) {
+        return false;
+    }
+    /* 寄存器写入只允许 32/64 位(ARM64 没有 8/16 位寄存器写法)。 */
+    if (m->dst == HOOK_DST_REG && width != 32 && width != 64) {
+        snprintf(err, errcap, "寄存器写入的位宽只能是 32 或 64");
+        return false;
+    }
+    m->expr = dup_str(expr);
+    return true;
+}
+
+/* 解析一条 Hook 条目。失败返回 false + err。 */
+static bool load_hook(NSDictionary *it, HookSpec *h, char *err, size_t errcap) {
+    memset(h, 0, sizeof(*h));
+    h->hook_name  = dup_str(it[@"hookName"]);
+    h->module     = dup_str(it[@"module"]);
+    h->target     = parse_hex(it[@"target"]);
+    h->delay_secs = parse_int(it[@"delaySecs"], 0);
+    h->max_hits   = parse_size(it[@"maxHits"]); /* 0 = 不限 */
+    if (h->module == NULL) {
+        snprintf(err, errcap, "缺少 module");
+        return false;
+    }
+
+    NSArray *mods = it[@"mods"];
+    if (![mods isKindOfClass:[NSArray class]] || mods.count == 0) {
+        snprintf(err, errcap, "没有任何修改数据功能");
+        return false;
+    }
+    /* 逐条统计启用的 mod;全停用等于这条 Hook 没事做,直接拒。 */
+    int enabled = 0;
+    for (NSDictionary *md in mods) {
+        if ([md isKindOfClass:[NSDictionary class]] &&
+            parse_bool(md[@"enabled"], true)) {
+            enabled++;
         }
-
-        NSString *processName = [[NSProcessInfo processInfo] processName];
-        qbdi_console_logf("engine loaded: app=%s bundle=%s pid=%d",
-                          processName.UTF8String ?: "(unknown)",
-                          bundleId.UTF8String ?: "(unknown)",
-                          [[NSProcessInfo processInfo] processIdentifier]);
-
-        /* settings.json 先读:总开关关着就立刻返回,另外两份配置根本不用碰。
-         * 它还带着日志根目录,必须在任何文件日志产生之前设好。 */
-        NSDictionary *settings = read_json_dict(config_file(@"settings.json"));
-
-        NSString *path = config_path();
-        NSData *data = [NSData dataWithContentsOfFile:path];
-        NSError *jsonError = nil;
-        NSDictionary *cfg = nil;
-        if (data != nil) {
-            cfg = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
-            if (![cfg isKindOfClass:[NSDictionary class]]) {
-                qbdi_console_logf("config load failed: path=%s error=%s",
-                                  path.UTF8String,
-                                  jsonError.localizedDescription.UTF8String ?: "invalid root object");
-                return;
-            }
+    }
+    if (enabled == 0) {
+        snprintf(err, errcap, "所有修改数据功能都被停用");
+        return false;
+    }
+    if (enabled > HOOK_MAX_MODS) {
+        snprintf(err, errcap, "修改数据条目超过 %d 上限", HOOK_MAX_MODS);
+        return false;
+    }
+    h->mods = calloc((size_t)enabled, sizeof(HookMod));
+    if (h->mods == NULL) {
+        snprintf(err, errcap, "内存不足");
+        return false;
+    }
+    for (NSDictionary *md in mods) {
+        if (![md isKindOfClass:[NSDictionary class]] ||
+            !parse_bool(md[@"enabled"], true)) {
+            continue;
         }
+        if (!load_hook_mod(md, &h->mods[h->mod_count], err, errcap)) {
+            free(h->mods);
+            h->mods = NULL;
+            h->mod_count = 0;
+            return false;
+        }
+        h->mod_count++;
+    }
+    return true;
+}
 
-        if (settings != nil) {
-            id root = settings[@"logRoot"];
-            if ([root isKindOfClass:[NSString class]] && [root length] > 0) {
-                qbdi_trace_set_log_root([root UTF8String]);
-            }
-            if (!parse_bool(settings[@"enabled"], true)) {
-                return; /* 总开关关闭 */
-            }
+/* 装一个 hook 槽位的 Dobby 补丁(延迟到点后调用)。 */
+static void install_hook_slot(int slot) {
+    HookSpec *h = &g_hooks[slot];
+    qbdi_hook_logf("[engine] installing hook: slot=%d name=%s target=%s+0x%llx mods=%d\n",
+                   slot, h->hook_name ? h->hook_name : "(unnamed)",
+                   h->module ? h->module : "(null)",
+                   (unsigned long long)h->target, h->mod_count);
+    uint64_t base = 0;
+    if (!find_module(h->module, &base)) {
+        qbdi_hook_logf("[engine] hook module not found: %s (slot %d)\n",
+                       h->module, slot);
+        return;
+    }
+    uint64_t target_abs = base + h->target;
+    uint64_t conflict = 0;
+    if (installed_hook_conflict(target_abs, &conflict)) {
+        qbdi_hook_logf("[engine] hook install rejected: %s slot %d target 0x%llx "
+                       "near existing hook 0x%llx (patch 0x%x)\n",
+                       h->module, slot, (unsigned long long)target_abs,
+                       (unsigned long long)conflict, QBDI_PATCH_SIZE);
+        return;
+    }
+    g_hook_module_base[slot] = base;
+    void *target = (void *)(uintptr_t)target_abs;
+    void *origin = NULL;
+    int rc = DobbyHook(target, (void *)g_hook_tramps[slot], &origin);
+    if (rc == 0 && origin != NULL) {
+        g_hook_origin[slot] = origin;
+        remember_installed_hook(target_abs);
+        qbdi_hook_logf("[engine] hooked %s+0x%llx @ %p (slot %d, origin=%p)\n",
+                       h->module, (unsigned long long)h->target, target, slot,
+                       origin);
+    } else {
+        qbdi_hook_logf("[engine] hook DobbyHook failed(%d): %s+0x%llx (slot %d)\n",
+                       rc, h->module, (unsigned long long)h->target, slot);
+    }
+}
+
+/* 收集匹配当前 bundleId 且启用的 Hook,填进 g_hooks 并装 Dobby 补丁。 */
+static void load_and_install_hooks(NSString *bundleId) {
+    NSDictionary *cfg = read_json_dict(config_file(@"hooks.json"));
+    if (cfg == nil) return;
+    NSArray *hooks = cfg[@"hooks"];
+    if (![hooks isKindOfClass:[NSArray class]] || hooks.count == 0) return;
+
+    for (NSDictionary *it in hooks) {
+        if (g_hook_count >= HOOK_MAX_TARGETS) {
+            qbdi_hook_logf("[engine] too many hooks, cap=%d\n", HOOK_MAX_TARGETS);
+            break;
+        }
+        if (![it isKindOfClass:[NSDictionary class]]) continue;
+        id bid = it[@"bundleId"];
+        if (![bid isKindOfClass:[NSString class]] || bundleId == nil ||
+            ![bid isEqualToString:bundleId]) {
+            continue;
+        }
+        if (!parse_bool(it[@"enabled"], true)) continue;
+
+        int slot = g_hook_count;
+        char herr[128];
+        if (!load_hook(it, &g_hooks[slot], herr, sizeof(herr))) {
+            qbdi_hook_logf("[engine] skip hook (slot %d): %s\n", slot, herr);
+            memset(&g_hooks[slot], 0, sizeof(g_hooks[slot]));
+            continue;
+        }
+        HookSpec *h = &g_hooks[slot];
+        for (int i = 0; i < h->mod_count; i++) {
+            HookMod *m = &h->mods[i];
+            qbdi_hook_logf("[%s] hook mod[%d]: %s %s dst=%s%s\n",
+                           h->module, i + 1, hook_val_type_name(m->type),
+                           m->expr ? m->expr : "?",
+                           m->dst == HOOK_DST_REG ? "reg" : "mem",
+                           m->dst == HOOK_DST_REG ? "" : "");
+        }
+        g_hook_count++;
+    }
+
+    if (g_hook_count == 0) return;
+    hook_init_state();
+    qbdi_trace_crash_diag_init(); /* 只有 hook、没有 trace 时也要留崩溃档 */
+    for (int slot = 0; slot < g_hook_count; slot++) {
+        int delay = g_hooks[slot].delay_secs;
+        if (delay <= 0) {
+            install_hook_slot(slot);
         } else {
-            /* settings.json 还不存在 = 用户升级后还没打开过控制 App。此时总开关
-             * 仍在旧 config.json 里,必须回落去读它 —— 否则"原本关掉的插件"会
-             * 在这段窗口期自己变成开启。App 首次启动会把它迁到 settings.json。 */
-            if (cfg != nil && !parse_bool(cfg[@"enabled"], true)) {
-                return;
-            }
+            int captured = slot;
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay * NSEC_PER_SEC),
+                dispatch_get_main_queue(), ^{ install_hook_slot(captured); });
+            qbdi_hook_logf("[engine] hook slot %d will install after %ds\n",
+                           slot, delay);
         }
+    }
+}
 
-        if (cfg == nil) {
-            return; /* 无 trace 配置:空转返回(全量注入的其它 app 走这里) */
-        }
+/* 收集匹配当前 bundleId 且启用的 trace 条目,填 g_traces 并装 Dobby 补丁。
+ * 内部的 return 只表示"这个 app 没有可用 trace",不影响后续 Hook 处理。 */
+static void load_and_install_traces(NSString *bundleId, NSDictionary *cfg) {
         NSArray *items = cfg[@"items"];
         if (![items isKindOfClass:[NSArray class]] || items.count == 0) {
             return;
@@ -989,5 +1149,61 @@ void engine_start(void) {
                                 slot, delay);
             }
         }
+}
+
+void engine_start(void) {
+    @autoreleasepool {
+        NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
+        /* 控制 App 自己不 hook */
+        if (bundleId != nil && [bundleId isEqualToString:GUI_BUNDLE_ID]) {
+            return;
+        }
+
+        NSString *processName = [[NSProcessInfo processInfo] processName];
+        qbdi_console_logf("engine loaded: app=%s bundle=%s pid=%d",
+                          processName.UTF8String ?: "(unknown)",
+                          bundleId.UTF8String ?: "(unknown)",
+                          [[NSProcessInfo processInfo] processIdentifier]);
+
+        /* settings.json 先读:总开关关着就立刻返回,另外两份配置根本不用碰。
+         * 它还带着日志根目录,必须在任何文件日志产生之前设好。 */
+        NSDictionary *settings = read_json_dict(config_file(@"settings.json"));
+
+        NSString *path = config_path();
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        NSError *jsonError = nil;
+        NSDictionary *cfg = nil;
+        if (data != nil) {
+            cfg = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+            if (![cfg isKindOfClass:[NSDictionary class]]) {
+                qbdi_console_logf("config load failed: path=%s error=%s",
+                                  path.UTF8String,
+                                  jsonError.localizedDescription.UTF8String ?: "invalid root object");
+                return;
+            }
+        }
+
+        if (settings != nil) {
+            id root = settings[@"logRoot"];
+            if ([root isKindOfClass:[NSString class]] && [root length] > 0) {
+                qbdi_trace_set_log_root([root UTF8String]);
+            }
+            if (!parse_bool(settings[@"enabled"], true)) {
+                return; /* 总开关关闭 */
+            }
+        } else {
+            /* settings.json 还不存在 = 用户升级后还没打开过控制 App。此时总开关
+             * 仍在旧 config.json 里,必须回落去读它 —— 否则"原本关掉的插件"会
+             * 在这段窗口期自己变成开启。App 首次启动会把它迁到 settings.json。 */
+            if (cfg != nil && !parse_bool(cfg[@"enabled"], true)) {
+                return;
+            }
+        }
+
+        if (cfg != nil) {
+            load_and_install_traces(bundleId, cfg);
+        }
+        /* Hook 与 trace 相互独立:即使这个 app 没有 trace,也可能有 hook。 */
+        load_and_install_hooks(bundleId);
     }
 }

@@ -3,6 +3,7 @@
 #include <dobby.h>
 
 #include "config.h"
+#include "hook.h"
 #include "qbdi_trace.h"
 
 /* trampoline 的最终间接跳转必须占用一个通用寄存器。Dobby 在 arm64 上明确把
@@ -177,6 +178,20 @@ TRIGGER_TRAMP(104) TRIGGER_TRAMP(105) TRIGGER_TRAMP(106) TRIGGER_TRAMP(107) TRIG
 TRIGGER_TRAMP(112) TRIGGER_TRAMP(113) TRIGGER_TRAMP(114) TRIGGER_TRAMP(115) TRIGGER_TRAMP(116) TRIGGER_TRAMP(117) TRIGGER_TRAMP(118) TRIGGER_TRAMP(119)
 TRIGGER_TRAMP(120) TRIGGER_TRAMP(121) TRIGGER_TRAMP(122) TRIGGER_TRAMP(123) TRIGGER_TRAMP(124) TRIGGER_TRAMP(125) TRIGGER_TRAMP(126) TRIGGER_TRAMP(127)
 #undef TRIGGER_TRAMP
+
+/* Hook 入口:与 trace 用同一套现场保存/恢复,只是 C 入口换成 hook_ctx_entry。
+ * hook_ctx_entry 会改写 rf 里的寄存器槽,恢复时这些改动进真实寄存器 ——
+ * 所以 Hook 的寄存器修改能持久生效,而不是像 trace 那样跑完就丢。 */
+#define HOOK_TRAMP(slot) TRAMP(hook, slot, hook_ctx_entry)
+HOOK_TRAMP(0)  HOOK_TRAMP(1)  HOOK_TRAMP(2)  HOOK_TRAMP(3)
+HOOK_TRAMP(4)  HOOK_TRAMP(5)  HOOK_TRAMP(6)  HOOK_TRAMP(7)
+HOOK_TRAMP(8)  HOOK_TRAMP(9)  HOOK_TRAMP(10) HOOK_TRAMP(11)
+HOOK_TRAMP(12) HOOK_TRAMP(13) HOOK_TRAMP(14) HOOK_TRAMP(15)
+HOOK_TRAMP(16) HOOK_TRAMP(17) HOOK_TRAMP(18) HOOK_TRAMP(19)
+HOOK_TRAMP(20) HOOK_TRAMP(21) HOOK_TRAMP(22) HOOK_TRAMP(23)
+HOOK_TRAMP(24) HOOK_TRAMP(25) HOOK_TRAMP(26) HOOK_TRAMP(27)
+HOOK_TRAMP(28) HOOK_TRAMP(29) HOOK_TRAMP(30) HOOK_TRAMP(31)
+#undef HOOK_TRAMP
 #undef TRAMP
 
 /* 槽位 → trampoline 函数指针(engine.m 装 hook 时按 slot 取) */
@@ -209,5 +224,15 @@ const void *g_trigger_tramps[TRACE_MAX_TRIGGER_HOOKS] = {
     T(104) T(105) T(106) T(107) T(108) T(109) T(110) T(111)
     T(112) T(113) T(114) T(115) T(116) T(117) T(118) T(119)
     T(120) T(121) T(122) T(123) T(124) T(125) T(126) T(127)
+#undef T
+};
+
+/* Hook 的独立 trampoline 表(32 个,对应 HOOK_MAX_TARGETS)。 */
+const void *g_hook_tramps[HOOK_MAX_TARGETS] = {
+#define T(slot) (const void *)hook_tramp_##slot,
+    T(0)  T(1)  T(2)  T(3)  T(4)  T(5)  T(6)  T(7)
+    T(8)  T(9)  T(10) T(11) T(12) T(13) T(14) T(15)
+    T(16) T(17) T(18) T(19) T(20) T(21) T(22) T(23)
+    T(24) T(25) T(26) T(27) T(28) T(29) T(30) T(31)
 #undef T
 };
