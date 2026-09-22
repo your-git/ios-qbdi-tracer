@@ -131,6 +131,16 @@
                                          handler:^(UIAlertAction *a) {
               [self showMutationHelp];
           }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Hook 修改数据"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+              [self showHookHelp];
+          }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Hook 写入目标怎么填"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+              [self showHookTargetHelp];
+          }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"查看日志输出位置"
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) {
@@ -192,6 +202,48 @@
         @"只有成功到达结束地址才会计数；失败会释放本次额度。无论各条件上限合计多少，"
         @"最终仍受 Trace 总次数限制。\n\n"
         @"自定义地址的匹配只授权同一线程下一次到达起始地址。"];
+}
+
+- (void)showHookHelp {
+    [self alert:@"Hook 修改数据"
+        message:
+        @"Hook 与 Trace 是两回事:Trace 只记录、跑完现场就还原;Hook 用 Dobby 在"
+        @"目标地址**真实改写**目标进程的寄存器或内存,续跑后一直有效。改错了就是"
+        @"真的改错了,请先用 Trace/监视确认清楚地址再动手。\n\n"
+        @"命中即执行:默认每次经过目标地址都会应用修改。「执行次数上限」填 N 表示"
+        @"只改前 N 次,填 0 表示不限。\n\n"
+        @"目标内存只读时,引擎会先临时提权(vm_protect)再写、写完恢复原保护位。"
+        @"地址没映射、跨内存区或提权失败都会安全跳过,不会让目标 App 崩。\n\n"
+        @"取址表达式连续 20 次都求不出地址(多级指针读不出来、算出野指针),这条 Hook "
+        @"会自动停用并写进日志 —— 避免一直白跑。中途只要成功一次,计数就清零。\n\n"
+        @"日志:<日志根目录>/hook-logs/hook_<年月日时分>.log,按第 1/10/100/1000… 次"
+        @"记录地址、旧值和新值(热点上不会写爆)。同一次运行里 Trace 和 Hook 的日志"
+        @"时间戳相同,方便对照。\n\n"
+        @"⚠️ Dobby 补丁会覆盖目标地址往后 0x10 字节。请选不会有其它代码(循环头、"
+        @"分支目标)跳进这 0x10 字节的位置,否则控制流会被破坏。不同 Hook 之间、"
+        @"Hook 与 Trace 的起始/触发地址之间,也都必须至少相差 0x10。\n\n"
+        @"改完配置要重开目标 App 才生效。"];
+}
+
+- (void)showHookTargetHelp {
+    [self alert:@"Hook 写入目标怎么填"
+        message:
+        @"「写入目标」填的是寄存器或取址表达式,含义随**修改类型**变化:\n\n"
+        @"【数值】\n"
+        @"  x0        → 直接改寄存器 x0 本身(只能选 32 或 64 位;\n"
+        @"              32 位等价写 wN,会清零高 32 位)\n"
+        @"  [x0]      → 改 x0 指向的内存\n"
+        @"  [x0+0x10] → 改 x0+0x10 处的内存(8/16/32/64 位都可以)\n\n"
+        @"【字节】\n"
+        @"  只能改内存,**必须**用 [ ] 指定地址。裸寄存器会被拒绝 ——\n"
+        @"  寄存器装的是地址,往寄存器里写不了一串字节。\n"
+        @"  内容按内存顺序填,如 08a48c90(与 hexdump 所见一致)。\n\n"
+        @"【字符串】\n"
+        @"  x0        → 把 x0 的值当字符串首地址(char*),写到它指向的地方\n"
+        @"  [x0+0x8]  → 先取出该处的指针,再写到指针指向的地方\n"
+        @"  底层自动补一个 0 结尾。长度最好不超过原字符串,否则会覆盖相邻数据。\n\n"
+        @"方括号里支持多级解引用与加减,如 [[x0+8]+0x10]。\n"
+        @"字节与字符串最多 256 字节(字符串含结尾 0)。"];
 }
 
 - (void)showMutationHelp {

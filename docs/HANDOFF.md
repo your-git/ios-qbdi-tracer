@@ -9,12 +9,13 @@
 | 文件 | 行数 | 作用 | 改动频率 |
 |---|---|---|---|
 | `Tweak.x` | 小 | 入口。`__attribute__((constructor))` → `engine_start()`。**不用 Logos %ctor**(Apple clang 21+ 编不过其 `__unused` 参数) | 几乎不改 |
-| `src/engine.m` | 236 | **核心新代码**。读 JSON、匹配 bundleId、填 `g_traces`/`g_watches`、每条目 dispatch_after 延迟装 Dobby hook。也定义了 `g_traces/g_watches/g_trace_count/g_watch_count` 和 `find_module` | 加字段/改匹配逻辑时 |
-| `src/tramp.c` | ~150 | 固定 32 个 naked arm64 trampoline + `g_tramps[]` 指针表。保存完整现场并恢复除 Dobby 临时寄存器 x17 外的状态；x17 专门承载 origin，最终 `br x17`(栈帧 `0x320`)。少存任何一样或覆盖续跑地址都会破坏控制流 | **改完必须反汇编核对** |
-| `src/qbdi_trace.c` | 680 | QBDI 引擎:VM 记录、`trace_ctx_entry`(记录后原生续跑)、`watch_handle`、崩溃捕获 | 改 trace/watch 行为时 |
+| `src/engine.m` | ~500 | **核心新代码**。先读 settings.json(总开关+日志根目录),再读 config.json 装 trace、hooks.json 装 hook。填 `g_traces`/`g_watches`/`g_hooks`,每条目 dispatch_after 延迟装 Dobby hook。含 `load_and_install_traces`/`load_and_install_hooks`/`load_hook`/`load_hook_mod` 和 `find_module` | 加字段/改匹配逻辑时 |
+| `src/tramp.c` | ~230 | 固定 32 trace + 128 trigger + 32 hook 个 naked arm64 trampoline + `g_tramps[]`/`g_trigger_tramps[]`/`g_hook_tramps[]`。保存完整现场并恢复除 Dobby 临时寄存器 x17 外的状态；x17 专门承载 origin，最终 `br x17`(栈帧 `0x320`)。三种入口共用同一 TRAMP 宏,只差 C 入口函数名。少存任何一样或覆盖续跑地址都会破坏控制流 | **改完必须反汇编核对** |
+| `src/qbdi_trace.c` | ~760 | QBDI 引擎:VM 记录、`trace_ctx_entry`(记录后原生续跑)、`watch_handle`、崩溃捕获。也含日志路径工具 `qbdi_trace_set_log_root`/`qbdi_log_timestamp`/`qbdi_log_build_path`(hook 日志复用) | 改 trace/watch/日志位置时 |
 | `src/qbdi_trace.h` | 55 | LOG_* 位、`TRACE_MAX_TARGETS=32`/`TRACE_MAX_WATCHES=128`、`TraceRegFile`、函数声明 | 改上限时 |
 | `src/watch_expr.{h,c}` | ~420 | **watch 取址表达式**(`x0-0x110`、`[[x0+8]+0x10]-4`)的编译与求值。递归下降 parser → 后缀式,加载期编译、命中时求值。纯 C,不依赖 QBDI(便于在 mac 上直接编译自测) | 改表达式语法时 |
-| `src/config.h` | 40 | `TraceSpec`/`TraceWatch` 结构定义 + 表的 extern 声明 | 加字段时 |
+| `src/hook.{h,c}` | ~500 | **Hook 运行期**(用 Dobby 真实改数据,非 QBDI)。`hook_ctx_entry`(改寄存器/内存后原生续跑)、`hook_encode_value`(字节/字符串/数值编码)、`hook_classify_target`(不对称写入语义)、`vm_protect` 提权写内存、连续失败自愈、hook 日志。纯逻辑部分可提取自测 | 改 hook 行为/语义时 |
+| `src/config.h` | ~120 | `TraceSpec`/`TraceWatch`/`HookSpec`/`HookMod` 结构定义 + 表的 extern 声明。`HOOK_MAX_TARGETS=32`/`HOOK_MAX_MODS=16`/`HOOK_VAL_MAX=256` | 加字段时 |
 | `src/engine.h` | 10 | `g_tramps[]` 和 `engine_start()` 声明 | 几乎不改 |
 | `TracerEngine.plist` | 1 | 注入过滤:`{ Filter = { Bundles = ( "com.apple.UIKit" ); }; }` | 改注入范围时 |
 | `Makefile` | 小 | tweak 子工程。include 路径用 `$(THEOS_PROJECT_DIR)/Engine/...` | 加源文件时 |
@@ -24,19 +25,26 @@
 | 文件 | 行数 | 作用 |
 |---|---|---|
 | `entry.m` | 10 | `UIApplicationMain` |
-| `src/AppDelegate.m` | 17 | 建 window + 导航栈,root = RootListVC |
-| `src/ConfigStore.{h,m}` | ~290 | **JSON 读写**。`load`/`save`/`newItem` + **导出/导入**(`exportItem`/`listImportableFiles`/`importItemFromData`/`importItemFromString`/`exportDir`)。路径探测(rootless /var/jb)。**与引擎 schema 必须一致** |
+| `src/AppDelegate.m` | ~50 | 建 window + **底部 TabBar**(Trace=RootListVC / Hook=HookListVC,各自一个 NavController)。启动时先触发 AppSettings 加载与总开关迁移 |
+| `src/AppSettings.{h,m}` | ~180 | **settings.json 读写 + 全部路径**:总开关 `enabled`、`logRoot`、`exportRoot`;四个落地子目录(trace-logs/hook-logs/trace/hook);总开关从旧 config.json 的迁移;`directoryUsable`(真写探针文件判断可写)。`QBDIConfigDir/QBDIDocumentsDir/QBDIDefault*` 也在这 |
+| `src/ConfigStore.{h,m}` | ~280 | **config.json(trace)读写**。`load`/`save`/`newItem` + 导出/导入。不再管总开关(搬到 AppSettings)。导出走 `<exportRoot>/trace/`、文件名 `trace_` 前缀;导入列表兼容扫旧 Documents 根。**与引擎 schema 必须一致** |
+| `src/HookStore.{h,m}` | ~230 | **hooks.json 读写**。`load`/`save`/`newHook`/`newMod` + 导出(`<exportRoot>/hook/`、`hook_` 前缀、体带 `type:"hook"`)/导入 + `+detectType:`(按内容判 trace/hook,供导入分流)。**与引擎 hook schema 必须一致** |
 | `src/ExprInput.{h,m}` | ~320 | **取址表达式的输入与校验**,两个编辑页共用:`ExprSyntaxOK`/`ExprBaseReg`(轻量语法校验,**要与 `watch_expr.c` 的文法一致**)+ `ExprPrompt`(表达式快捷栏)+ `AttachHexKeyboard`(地址输入的 `0X 0-9 A-F` 快捷栏) |
 | `src/HexValue.{h,m}` | ~50 | 「字节长度」类字段(watch 的 `size`、触发条件的 `triggerScan`)的进制处理:`HexValueFromJSON`(JSON 看前缀定进制)/ `HexParseInput`(输入框一律 hex)/ `HexDisplay`。**与引擎 `parse_size` 规则必须一致** |
 | `src/NavController.{h,m}` | ~50 | `UINavigationController` 子类,override `navigationBar:shouldPopItem:` 来**拦住系统返回按钮**(UIKit 没有公开的"即将 pop"回调;这依赖 UINavigationController 私下就是自己 navigationBar 的 delegate)。含 `NavPopGuard` 协议 |
 | `src/FormEditVC.{h,m}` | ~120 | 表单编辑页**基类**:快照 / 脏检查 / 「放弃修改?」确认；编辑页显示期间一律禁用右滑返回。TraceEditVC 和 WatchEditVC 都继承它 |
-| `src/RootListVC.m` | ~450 | 主界面。总开关 + 条目列表。点击=编辑,前缘滑=启停,尾缘滑=命名/导出/复制/删除。自定义名称存在时用三行展示，旧 JSON 仍用两行 |
+| `src/RootListVC.m` | ~450 | **Trace 列表页**。总开关(读写 AppSettings)+ 条目列表。点击=编辑,前缘滑=启停,尾缘滑=命名/导出/复制/删除。左上角走 `MoreMenuBarButton`;实现 `QBDIListPage`。所有提示改成手动点「好」的 `notify:` |
+| `src/HookListVC.m` | ~320 | **Hook 列表页**。结构同 RootListVC,操作 HookStore;+ 菜单=创建/导入 Hook;实现 `QBDIListPage` |
+| `src/HookEditVC.m` | ~300 | Hook 表单:目标 App、模块名、目标地址、延迟、执行次数上限、「添加功能」列表(修改数据/读取数据研发中);功能行左滑删除 |
+| `src/HookModEditVC.m` | ~320 | 「修改数据」编辑页:表达式弹窗、类型(字节/字符串/数值)、位宽、修改内容。`classifyTarget` 镜像引擎 `hook_classify_target`,「完成」做即时校验;选字符串弹一次超长警告 |
+| `src/SettingsVC.m` | ~180 | 设置页(继承 FormEditVC):日志根目录 / 导入导出根目录 + 每项「恢复默认」;保存前 `directoryUsable` 校验 |
+| `src/MoreMenu.{h,m}` | ~330 | 左上角「更多」菜单(两个列表页共用):帮助(含 Hook 章节)、设置、新增副本、页面切换。`QBDIListPage` 协议在这 |
 | `src/AppPickerVC.m` | 141 | 应用选择器。`LSApplicationWorkspace`(私有 API)列所有 app 图标+名字+bundleId,带搜索 |
 | `src/TraceEditVC.m` | ~400 | trace 表单。恢复 1–16 次；触发条件为不限数量的子表，含 repeat/once/custom 消耗策略和地址间距校验 |
 | `src/TriggerEditVC.m` | ~350 | 单条触发条件编辑页；custom 下显示 1–16 的触发次数上限，并负责表达式、地址、匹配与期望值校验 |
 | `src/MutationEditVC.m` | ~300 | Trace 内寄存器修改编辑页：地址、寄存器、32/64 位、值、once/always；不提供内存写入 |
 | `src/WatchEditVC.m` | ~217 | watch 表单。寄存器/action 用 action sheet;寄存器那栏顶部的「✎ 输入取址表达式…」走 `ExprInput` 的弹窗;size 走 `HexValue` |
-| `src/ImportVC.m` | ~110 | **从文件导入**列表页。列 exportDir 里的 .json,点选 → 校验 → 加入 items |
+| `src/ImportVC.m` | ~150 | **从文件导入**页:底部 Trace|Hook 分页(UISegmentedControl 放导航工具栏)。列各自导出目录 + 旧 Documents 根的 .json;点选按 `HookStore detectType` 的真实类型导入,与当前页不符时自动分流并提示。`initialHookPage` 决定默认页 |
 | `Resources/Info.plist` | - | **必须在 Resources/**,否则图标不出现。bundleId=`com.snk.qbditracer`。含 `UIFileSharingEnabled`+`LSSupportsOpeningDocumentsInPlace`(导出文件供 Finder 文件共享取出) |
 | `entitlements.plist` | - | platform-application + no-container + get-task-allow(私有 API + 写 /var/mobile) |
 | `Makefile` | 小 | app 子工程。CFLAGS 含 `-I$(THEOS_PROJECT_DIR)/GUI/src` |
@@ -116,6 +124,23 @@
 每次 Trace 首次命中，`always` 是每次命中。完整命中写文件，控制台只报每条规则首次，
 避免热循环刷爆 Console。改完跑本机测试第 5 组。
 
+### A6. 改 Hook(加字段 / 改写入语义)
+
+Hook 与 Trace 完全独立,配置在 `hooks.json`。加 hook 条目字段或 mod 字段:
+1. `Engine/src/config.h` —— `HookSpec` / `HookMod` 加字段
+2. `Engine/src/engine.m` —— `load_hook` / `load_hook_mod` 解析(加载期严格校验,配错拒整条)
+3. `Engine/src/hook.c` —— `hook_ctx_entry` 消费它(改寄存器/内存)
+4. `GUI/src/HookStore.m` —— `newHook` / `newMod` 默认值 + `importHookFromData` 的 key 白名单(漏了导出再导入会丢)
+5. `GUI/src/HookEditVC.m` / `HookModEditVC.m` —— 加 UI
+
+**写入语义(不对称表)有两份实现,必须同步**(和 A3 同理):
+- 引擎 `Engine/src/hook.c`:`hook_classify_target` / `outer_bracket` / `bare_register`(权威)
+- GUI `GUI/src/HookModEditVC.m`:`classifyTarget` / `exprBracketed` / `exprBareRegister`(即时校验)
+
+漂移后果是"App 说没问题、装上却被引擎拒(整条 Hook 不装)"。改完跑 `./scripts/test_watch_expr.sh` 第 6 组,它从两边**原样提取**函数交叉验证语义、值编码(字节内存序/字符串补 0/数值小端)与 256 字节边界。
+
+边界不可随意放宽:数值 8/16 位只对**内存**开放,改**寄存器**只能 32/64;字节写内存必须用 `[]`,裸寄存器拒;字节容忍前导 `0x`(hex 辅助键盘有「0X」键,GUI/引擎两边都要剥,否则 App 放行、引擎拒)。连续 20 次求址失败自愈停用(`HOOK_FAIL_LIMIT`)。
+
 ### B. 改注入范围
 
 改 `Engine/TracerEngine.plist` 的 Bundles。比如只注入特定 app 可写死 bundleId 列表;但当前"全量注入+配置匹配"更灵活(见 DESIGN.md §3)。
@@ -131,11 +156,10 @@
 
 ### E. 改日志路径
 
-`qbdi_trace.c` 顶部的 `TRACE_LOG_DIR` / `TRACE_LOG_PREFIX`(当前 `/tmp/qbdi_trace_<年月日时分>.log`)。文件名在 `trace_log_open` 里按进程首次写日志的时间用 `strftime("%Y%m%d%H%M")` 生成一次。若想改成"固定文件名"或"每条 trace 一个文件",改这个函数。
+日志根目录 `logRoot` 来自 `settings.json`,用户可在设置页改。引擎读完 settings 后调 `qbdi_trace_set_log_root`;之后 trace 日志走 `<logRoot>/trace-logs/trace_<时间戳>.log`、hook 日志走 `<logRoot>/hook-logs/hook_<时间戳>.log`(`qbdi_trace.c` 的 `TRACE_LOG_SUBDIR`、`hook.c` 的 `HOOK_LOG_SUBDIR`)。文件名时间戳 `%y%m%d%H%M`(年份两位)由 `qbdi_log_timestamp` **全进程生成一次**、trace/hook 共享 —— 同一次运行两份日志后缀必须一致,别把它改成各自取时间。子目录名要和 `GUI/src/AppSettings.h` 的 `QBDI_*_LOG_SUBDIR` 保持一致。`qbdi_log_build_path` 负责拼路径 + `mkdir -p`。
 
 运行状态与错误还会通过 `qbdi_console_logf` 写入 iPhone 系统控制台，统一前缀
-`[ios-qbdi-tracer]`。`qbdi_trace_logf` 会同时写文件和控制台；逐指令内容直接写 `FILE *`
-而不进控制台，避免刷屏。新增 hook 生命周期或失败分支时优先走这两个入口。
+`[ios-qbdi-tracer]`。`qbdi_trace_logf`(trace)/`qbdi_hook_logf`(hook)会同时写各自文件和控制台；逐指令/逐次命中内容直接写 `FILE *` 而不进控制台，避免刷屏。
 
 ## 别踩的坑(血泪)
 
@@ -187,6 +211,11 @@
 23. **启停只能在写入 JSON 成功后更新界面**:保存失败时要恢复内存中的 `enabled`，否则会出现“界面已停用，目标 App 重启后仍启用”。UI 和引擎对旧 JSON 缺失 `enabled` 的默认值都必须是 `true`，否则会显示为停用但引擎仍执行。引擎只在目标 App 启动时读一次配置，所以成功切换后仍必须重启目标 App。
 24. **`traceName` 是可选展示字段**:旧 JSON 没有时必须保持原来的两行展示；导入白名单必须保留它，复制/导出也必须带上。空白名称要删除 key，不要显示空的第一行。
 25. **每个不同的自定义触发地址会多一个 Dobby Hook**:同一 trace 内相同地址共享 Hook；不同地址彼此及与 start 至少相差 `0x10`，且不能在 `(start,end)` 内。数值在区间外不代表动态路径不会经过它；帮助里的 QBDI/Dobby 冲突提示不能删。
+26. **总开关搬到了 settings.json,迁移必须两头做**:App(`AppSettings load`)在 settings.json 缺失时读旧 config.json 的 enabled 再写出;引擎(`engine_start`)在 settings.json 缺失时同样回落读旧值。少任何一头,老用户升级后关掉的插件会自己变开。引擎**先读 settings.json**,总开关关着立即返回,别把这个顺序改了(否则丢了"关掉就不读另外两份"的省事)。
+27. **Hook 写入语义有两份实现**(引擎 `hook.c` 的 `hook_classify_target` 与 GUI `HookModEditVC.m` 的 `classifyTarget`),漂移后果同触发条件/watch:App 放行、引擎拒。见 §A6,改完跑第 6 组。
+28. **Hook 是真的改数据,不是 QBDI 虚拟修改**:寄存器修改靠 hook trampoline 恢复时把改过的槽位写回真实寄存器而持久生效(别改成"跑完丢弃");内存写用 `vm_protect` 提权 —— 只读段也会被真的改。改错地址会让目标 App 崩,不像 trace 那样安全。
+29. **Hook 日志时间戳与 trace 共享一次生成**(`qbdi_log_timestamp`,`%y%m%d%H%M` 两位年份)。别让 hook 各自取时间,否则同一次运行的两份日志对不上号。
+30. **字节值容忍前导 `0x`**:hex 辅助键盘有「0X」键,GUI(`bytesValid`)和引擎(`hook_encode_value` 的 BYTES 分支)都要剥掉它,否则用户敲了 0X → App 放行、引擎拒。
 
 ## 本机自测(不用设备、不用 theos)
 
@@ -194,18 +223,20 @@
 ./scripts/test_watch_expr.sh
 ```
 
-跑四组:引擎表达式 parser 本身(编译/求值/多级解引用/失败诊断)、GUI 校验与引擎 parser
-的判断是否一致、size 进制规则两侧是否一致、触发条件期望值(bytes/cstr/u64)的解析与拒绝。
+跑**六组**:①引擎表达式 parser 本身(编译/求值/多级解引用/失败诊断)、②GUI 校验与引擎 parser
+的判断是否一致、③size 进制规则两侧是否一致、④触发条件期望值(bytes/cstr/u64)的解析与拒绝、
+⑤Trace 内寄存器修改配置解析、⑥**Hook 修改数据的不对称写入语义表 + 值编码 + 256 边界**。
 带 ASan/UBSan。
 
-第 2/3/4 组不复制被测代码,而是用 awk 从 `GUI/src/ExprInput.m`、`GUI/src/HexValue.m`、
-`Engine/src/engine.m`、`Engine/src/qbdi_trace.c` 里**原样提取**函数段落再编译。好处是测试永远跟着真实源码走;代价是
+第 2..6 组不复制被测代码,而是用 awk 从 `GUI/src/ExprInput.m`、`GUI/src/HexValue.m`、
+`Engine/src/engine.m`、`Engine/src/qbdi_trace.c`、`Engine/src/hook.c` 里**原样提取**函数段落再编译。好处是测试永远跟着真实源码走;代价是
 **改动那几处的段落标记(`#pragma mark`、`static uint64_t parse_size`、`static bool
-load_trigger`、`static bool trig_compare` 这些)会让提取失败** —— 脚本会直接报"提取失败",按提示把 awk 的匹配模式
+load_trigger`、`static bool trig_compare`、`static int hex_digit`、`bool hook_classify_target`、
+`static bool load_hook_mod` 这些)会让提取失败** —— 脚本会直接报"提取失败",按提示把 awk 的匹配模式
 跟着改一下就行。
 
-改了 `watch_expr.c`、`ExprInput.m` 的 `ExprScan`、`engine.m` 的 `load_trigger`/`parse_size`、
-或 `qbdi_trace.c` 的 `trig_compare`,务必跑一遍。
+改了 `watch_expr.c`、`ExprInput.m` 的 `ExprScan`、`engine.m` 的 `load_trigger`/`parse_size`/`load_hook_mod`、
+`qbdi_trace.c` 的 `trig_compare`、或 `hook.c` 的 `hook_encode_value`/`hook_classify_target`,务必跑一遍。
 
 提取用的是 awk 的 `index($0, sig) == 1` 字面量前缀匹配,**不是正则** —— 因为函数签名里的
 `*`(如 `static const char *dup_str`)当正则会被当成量词,而 awk 的 `-v` 还会吃掉转义反斜杠。
@@ -236,8 +267,9 @@ PY
 
 ## 已知限制
 
-- trace 条目 ≤ 32,watch ≤ 128(硬上限)
+- trace 条目 ≤ 32,watch ≤ 128,hook 条目 ≤ 32、单条 hook ≤ 16 条修改、单条修改载荷 ≤ 256 字节(均硬上限)
 - 被 trace 区域会执行两遍(记录 + 原生),有副作用的函数需留意
+- Hook 是真实改数据:改错地址会让目标 App 崩,内存写会 `vm_protect` 提权改到只读段,请先用 trace/watch 确认地址
 - QBDI 不处理 syscall/信号/C++ 异常;目标含 `svc`/大量 `objc_msgSend` 可能崩
 - 只 arm64(没做 arm64e);arm64e 设备需 arm64e 切片的 QBDI/Dobby
 - 改配置不实时生效,需重开目标 app
@@ -337,3 +369,30 @@ GUI 校验与引擎 parser 的判断、size 两侧的进制解析都交叉比对
 50. **启停保存失败**:在测试环境临时使配置目录不可写，操作后必须提示失败并恢复原勾选，不得出现假启用/假停用。
 51. **自定义名称**:左滑「命名」后显示三行；再次命名为空后恢复旧两行。名称同时出现在 hook 安装日志中。
 52. **名称兼容性**:旧 JSON 打开无空白行；命名后复制、导出再导入，`traceName` 都不丢失。
+
+### Hook 修改数据 / 三份配置拆分 / 主页重构(本次新增,只过了本机自测第 6 组)
+
+引擎 hook 写入通路 + 32 个 hook 跳板已过反汇编核对(`hook_ctx_entry` 32、`msr NZCV`/`mov x17,x0`
+各 192 = 32 trace+128 trigger+32 hook);不对称写入语义、值编码、256 边界过第 6 组。**但真机改数据没验证**:
+
+53. **三份配置**:全新安装后,设置里改路径 → `settings.json` 落 `logRoot`/`exportRoot`/`enabled`;
+    加 trace 落 `config.json`(不再含 enabled);加 hook 落 `hooks.json`。三份都 `cat` 核对。
+54. **总开关迁移**:用旧版 `config.json`(含 `enabled:false`)升级、还没打开控制 App 就重开目标 app →
+    引擎应回落读到 false 不干活;打开控制 App 后 `settings.json` 出现且 `enabled:false`,主页开关是关的。
+55. **数值改寄存器**:hook 一个点、`x8` + 数值 + 64 位,重开目标 app → 该点之后 x8 变成配置值且**持久**
+    (不是只在 hook 那一刻)。32 位模式高 32 位清零。
+56. **字节/字符串改内存**:`[x0]` + 字节写一段、`x0`(char\*)+ 字符串写一段 → 目标内存真的变了;
+    字符串底层带 `00` 结尾。日志 `hook-logs/hook_*.log` 有 old/new 对照。
+57. **只读段提权**:往一个只读数据段地址写 → 成功(vm_protect 生效);故意写未映射地址 → 安全跳过、
+    不崩,日志 `写入失败(不可写/跨区/未映射)`。
+58. **自愈**:配一个永远读不出的多级表达式 `[[x0+0x99999999]]` → 连续 20 次后日志出现"已自动停用",
+    之后不再尝试;目标 app 继续正常跑。
+59. **执行次数上限**:maxHits=1 → 只有第一次命中改,之后透传。
+60. **不对称语义拒绝**:字节 + 裸寄存器 `x0`、数值改寄存器选 8/16 位 → GUI「完成」当场拦;
+    手工写进 hooks.json 则引擎加载期拒该条并写日志,不装 hook。
+61. **共享时间戳**:同一次运行既有 trace 又有 hook → 两个日志文件名的 `<年月日时分>` 完全一致。
+62. **导入分流**:导入页切到 Hook 分页却选了一份 trace 导出文件 → 自动作为 Tracer 导入并提示;反之亦然。
+63. **主页/汉堡菜单**:底部 TabBar 切 Trace/Hook;左上角「更多」有帮助(含 Hook 章节)、设置、
+    新增副本(创建/导入 Tracer/Hook)、页面切换;右上角 + 跟随当前页。
+64. **弹窗改造**:启停/保存/导入等原来 1.2 秒自动消失的提示,现在都要手动点「好」才关。
+65. **Hook 编辑页返回拦截**:改一半点返回或右滑 → 与 trace 编辑页一致(弹「放弃修改?」/右滑无反应)。

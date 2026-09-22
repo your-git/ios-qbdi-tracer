@@ -198,7 +198,16 @@ bool hook_encode_value(HookMod *mod, HookValType type, uint8_t width,
 
     if (type == HOOK_VAL_BYTES) {
         int n = 0, hi = -1;
-        for (const char *s = value; s && *s; s++) {
+        const char *s = value;
+        /* 地址输入用的十六进制辅助键盘上有「0X」键,用户很容易顺手敲上。
+         * GUI 校验也会剥掉它 —— 这里不跟着剥的话,会表现成"App 说没问题、
+         * 引擎却拒掉整条 Hook"。 */
+        if (s != NULL) {
+            const char *p = s;
+            while (*p == ' ' || *p == '\t') p++;
+            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) s = p + 2;
+        }
+        for (; s && *s; s++) {
             if (*s == ' ' || *s == '\t' || *s == ':' || *s == ',') continue;
             int d = hex_digit(*s);
             if (d < 0) {

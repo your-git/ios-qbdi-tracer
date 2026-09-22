@@ -12,12 +12,12 @@ iOS 指令级 tracer:**运行期 JSON 配置 + 手机 UI 管理**,改配置不�
 
 ```
 ┌─ 控制 App(TracerGUI.app,主屏图标)──────────┐
-│  UIKit 表格应用,管理 trace 配置              │
+│  UIKit 表格应用,管理 trace/hook 配置         │
 │  bundleId = com.snk.qbditracer                │
 │               │ 写 JSON                        │
 └───────────────┼───────────────────────────────┘
                 ▼
-   /var/mobile/Documents/QBDITracer/config.json
+   /var/mobile/Documents/QBDITracer/{settings,config,hooks}.json
    (rootless: /var/jb/var/mobile/Documents/...)
                 ▲
 ┌───────────────┼───────────────────────────────┐
@@ -244,11 +244,34 @@ after N filtered calls`。
 
 ## 6. 配置文件 schema
 
-路径:`/var/mobile/Documents/QBDITracer/config.json`(rootless 加 `/var/jb` 前缀,引擎和 App 都会探测)。
+配置目录 `/var/mobile/Documents/QBDITracer/`(rootless 加 `/var/jb` 前缀,引擎和 App 都会探测)下有**三份文件**,各管各的:
+
+| 文件 | 内容 | 谁读 |
+|---|---|---|
+| `settings.json` | 总开关 `enabled` + 日志根目录 `logRoot` + 导入导出根目录 `exportRoot` | 引擎**最先读** + App |
+| `config.json` | 顶层 `items`(trace 条目) | 引擎 + App(ConfigStore) |
+| `hooks.json` | 顶层 `hooks`(hook 条目) | 引擎 + App(HookStore) |
+
+**为什么拆三份**:总开关和路径属于"设置",和具体条目是两个关注点;Trace 与 Hook 相互独立,混在一个文件里导出单条时容易互相带出、schema 也更易错。引擎先读 `settings.json`,总开关关着就立即返回,另外两份根本不用读(比原来还省)。
+
+**总开关迁移**:`enabled` 原来在 `config.json`,现已搬到 `settings.json`。迁移做两头 —— App 首次启动(AppSettings load)若 `settings.json` 不存在,就读旧 `config.json` 的 `enabled` 再写出 `settings.json`;引擎在 `settings.json` 缺失时同样回落读旧值。少任何一头,老用户升级后"原本关掉的插件"都会自己变成开启。
+
+### settings.json
 
 ```json
 {
-  "enabled": true,                    // 总开关
+  "enabled": true,                              // 总开关(Trace/Hook 共用)
+  "logRoot": "/tmp/ios-qbdi-tracer",            // 日志根目录;引擎按它定日志位置
+  "exportRoot": "/var/mobile/.../ios-qbdi-tracer-config-json"  // 仅 App 用
+}
+```
+
+`logRoot` 下自动建 `trace-logs/`、`hook-logs/`;`exportRoot` 下自动建 `trace/`、`hook/`。这些子目录名是固定的(引擎 `qbdi_trace.c` 的 `TRACE_LOG_SUBDIR` 与 App `AppSettings.h` 的 `QBDI_*_SUBDIR` 必须一致)。
+
+### config.json(trace)
+
+```json
+{
   "items": [
     {
       "id": "uuid",                   // 条目唯一 id
@@ -305,14 +328,69 @@ after N filtered calls`。
 
 **`size` 的进制看前缀**:`"0x110"` = 272,`"110"` = 110(十进制),裸数字 `272` = 272。旧配置里 size 是十进制数字,新 App 写出来一律是 `"0x..."` 字符串,靠前缀区分,不需要迁移。`start`/`end`/`offset` 则一律按十六进制解(带不带 `0x` 都一样)。
 
+### hooks.json(hook)
+
+```json
+{
+  "hooks": [
+    {
+      "id": "uuid",
+      "enabled": true,                 // 该条目勾选状态
+      "hookName": "登录返回值改写",     // 可选自定义名称
+      "bundleId": "com.zhiliaoapp.musically",
+      "appName": "settings",             // 仅 UI 展示
+      "module": "MainModule",         // dyld 镜像名子串
+      "target": "0x27A1F4E0",          // 目标地址:相对模块基址偏移(Dobby hook 落点)
+      "delaySecs": 0,                  // 延迟多少秒装 hook
+      "maxHits": 0,                    // 应用修改的次数上限;0=每次命中都改
+      "mods": [                        // 修改数据功能列表(最多 16 条)
+        { "enabled": true,
+          "kind": "modify",            // 目前只有 modify;read(读取数据)研发中
+          "type": "number",           // bytes | string | number
+          "width": 32,                 // number 才有意义:8/16/32/64
+          "expr": "[x0+0x10]",         // 寄存器/取址表达式(不对称语义见 §Hook)
+          "value": "0x1" }             // bytes:hex 串;string:UTF-8;number:hex
+      ]
+    }
+  ]
+}
+```
+
+## 6.4 Hook(用 Dobby 真实改数据)
+
+**与 Trace 的本质区别**:Trace 用 QBDI 在虚拟栈上**只读记录**、跑完恢复现场,`items[].mutations` 也只改 QBDI 虚拟寄存器、不写回真实 App。**Hook 是真的改**:在 `模块基址+target` 装 Dobby hook,命中后直接改写目标进程的寄存器或内存,续跑后一直有效。
+
+**执行路径**(`Engine/src/hook.c` 的 `hook_ctx_entry`):Dobby 命中 → hook trampoline(`tramp.c`,与 trace 同一套 `0x320` 完整现场保存)→ `hook_ctx_entry` 改写栈上保存的寄存器槽 / 调 `vm_write` 改内存 → trampoline 恢复现场(**含被改过的寄存器**)→ `br origin` 原生续跑。寄存器修改因此能持久生效,而不是像 trace 那样跑完就丢 —— 这正是复用 trace trampoline 的关键收益。
+
+**不对称写入语义**(最容易写错、写错就往错地址写内存 → 崩;`hook_classify_target` 实现):
+
+| 修改类型 | 裸寄存器 `x0` | `[x0]` / `[x0+0x10]` |
+|---|---|---|
+| 数值 | 改**寄存器本身**(仅 32/64 位,32 位按 wN 清高位) | 改**内存**,8/16/32/64 位 |
+| 字节 | ❌ 报错(裸寄存器写不了字节序列) | 改**内存** |
+| 字符串 | x0 的值当 **char\* 首地址**,写到那里 | 改**内存** |
+
+判定规则:整串被一对最外层 `[]` 包住 → 内存写,地址 = 方括号内部求值(复用 `watch_expr`);否则是单个裸寄存器 → 按上表分流;其余(如 `x0+0x10` 无括号)一律拒。
+
+**只读内存**:写前若目标页不可写,先 `vm_protect` 加写权限(带 `VM_PROT_COPY`,copy-on-write 不影响其它进程)、写完恢复原保护位。地址未映射/跨内存区/提权失败都安全跳过,不崩。
+
+**自愈**:取址表达式连续 `HOOK_FAIL_LIMIT`(20)次求不出地址就自动停用该 Hook(成功一次即清零),避免野配置一直白跑。
+
+**日志**:`<logRoot>/hook-logs/hook_<年月日时分>.log`,按第 1/10/100/1000… 次指数退避记地址/旧值/新值;**旧值只在要写日志的那几次才读**(省热路径 mach 调用)。时间戳与 trace 日志共享一次生成(`qbdi_log_timestamp`),同一次运行两份日志后缀一致。
+
+**上限**:32 条 Hook(`HOOK_MAX_TARGETS`,对应 `tramp.c` 的 32 个 hook 跳板)、单条 16 条修改(`HOOK_MAX_MODS`)、单条修改载荷 256 字节(`HOOK_VAL_MAX`)。Hook 的 target 与 Trace 的 start/trigger 补丁共用同一张已装地址表做 `0x10` 间距冲突检测(同进程两个 Dobby 补丁靠太近会互相踩坏,与类型无关)。
+
 ## 6.5 导出 / 导入
 
-- **导出**(trace 条目左滑「导出」):把该 item(含 triggers/mutations/watches)包成 `{"version":1,"item":{...}}` 写到 **App 沙盒 Documents**(`ConfigStore exportDir`,运行时探测)。文件名 `<appName净化><年月日时分>.json`(如 `Demo202608191647.json`)。成功弹框显示**实际落地完整路径**。
-- **取出**:App 的 Info.plist 开了 `UIFileSharingEnabled`+`LSSupportsOpeningDocumentsInPlace`,用户用 Finder 连手机 → 文件共享 → QBDI Tracer 拖出,不依赖越狱工具。
-- **导入**(左上角 + → 导入 Tracer):两种 —— 「从文件导入」(`ImportVC` 列 exportDir 里的 .json 点选)、「粘贴 JSON」(输入框)。都做校验:**解析失败或缺 module/start/end → 弹"配置格式无效"并中止**;通过则**重生 id、enabled=YES** 再加入 items,避免与现有条目冲突。
-- **兼容**:导入既接受 `{version,item}` 包装,也接受裸 item。
-- **系统级 app 沙盒风险**:控制 App 装在 `/Applications`(系统级),`NSHomeDirectory()`/Documents 是否是标准可共享沙盒**待真机确认**;`exportDir` 有回退逻辑,且落地路径始终显示给用户(不猜)。
+- **导出**:trace 条目左滑「导出」→ `{"version":1,"item":{...}}` 写到 `<exportRoot>/trace/`,文件名 `trace_<appName净化><年月日时分>.json`;hook 条目左滑「导出」→ `{"version":1,"type":"hook","hook":{...}}` 写到 `<exportRoot>/hook/`,文件名 `hook_<...>.json`。成功弹框显示实际落地完整路径。`exportRoot` 默认 `<Documents>/ios-qbdi-tracer-config-json`,可在设置页改。
+- **取出**:App 的 Info.plist 开了 `UIFileSharingEnabled`+`LSSupportsOpeningDocumentsInPlace`,用 Finder 连手机 → 文件共享 → QBDI Tracer 拖出。
+- **导入**(+ → 导入,或「更多 → 新增」):`ImportVC` 底部 **Trace|Hook 分页**,列各自导出目录 +**旧版 Documents 根**下的 .json(升级后不会"看起来全丢了")。点选文件时按**内容真实类型**(`HookStore detectType`:看 `type` 字段/包装 key/特征字段)导入 —— 选中的文件若与当前分页不符,自动导到正确的一类并提示。都会重生 id、enabled=YES。
+- **兼容**:trace 接受 `{version,item}` 或裸 item;hook 接受 `{version,type,hook}` 或裸 hook。
+- **系统级 app 沙盒风险**:控制 App 装在 `/Applications`(系统级),`NSHomeDirectory()`/Documents 是否是标准可共享沙盒**待真机确认**;`exportDir` 有回退逻辑,落地路径始终显示给用户。
 
 ## 7. schema 一致性(维护重点)
 
-控制 App(`GUI/src/ConfigStore.m` 的 `newItem`)和引擎(`Engine/src/engine.m` 的解析)**必须用同一套字段名**。改任何字段,两边都要改。这是本项目最容易出 bug 的地方 —— 详见 [HANDOFF.md](HANDOFF.md)。
+- **Trace**:控制 App(`GUI/src/ConfigStore.m` 的 `newItem`)和引擎(`Engine/src/engine.m` 的解析)**必须用同一套字段名**。
+- **Hook**:控制 App(`GUI/src/HookStore.m` + `HookEditVC`/`HookModEditVC`)和引擎(`engine.m` 的 `load_hook`/`load_hook_mod` + `hook.c`)也必须同步。特别是**不对称写入语义有两份实现**:GUI `HookModEditVC.m` 的 `classifyTarget`/`exprBracketed`/`exprBareRegister` 和引擎 `hook.c` 的 `hook_classify_target`/`outer_bracket`/`bare_register` 必须给出一致结论,否则"App 说没问题、装上却被拒"。
+
+改任何字段两边都要改。这是本项目最容易出 bug 的地方 —— 详见 [HANDOFF.md](HANDOFF.md)。改完跑 `./scripts/test_watch_expr.sh`(第 6 组交叉验证 hook 纯逻辑)。
