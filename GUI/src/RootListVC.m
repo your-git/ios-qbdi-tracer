@@ -76,6 +76,10 @@ static BOOL traceEnabled(NSDictionary *item) {
     [self presentViewController:ac animated:YES completion:nil];
 }
 
+/* QBDIListPage:供「更多 → 新增」副本调用 */
+- (void)beginCreate { [self addTrace]; }
+- (void)beginImport { [self importTracer]; }
+
 - (void)addTrace {
     /* 先选 app,选完进 trace 编辑表单 */
     AppPickerVC *picker = [AppPickerVC new];

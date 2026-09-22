@@ -32,6 +32,11 @@
               [host.navigationController pushViewController:[SettingsVC new]
                                                    animated:YES];
           }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"新增…"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+              [self showAdd];
+          }]];
 
     UITabBarController *tabs = host.tabBarController;
     if (tabs != nil && tabs.viewControllers.count >= 2) {
@@ -47,6 +52,45 @@
     [ac addAction:[UIAlertAction actionWithTitle:@"取消"
                                            style:UIAlertActionStyleCancel
                                          handler:nil]];
+    ac.popoverPresentationController.barButtonItem = self.anchor;
+    [host presentViewController:ac animated:YES completion:nil];
+}
+
+#pragma mark - 新增副本(创建/导入 Tracer/Hook)
+
+/* 切到第 idx 个标签页并回到它的列表根,返回那个列表 VC(实现 QBDIListPage)。 */
+- (id<QBDIListPage>)rootForTab:(NSInteger)idx {
+    UITabBarController *tabs = self.host.tabBarController;
+    if (tabs == nil || idx >= (NSInteger)tabs.viewControllers.count) return nil;
+    tabs.selectedIndex = idx;
+    UINavigationController *nav = tabs.viewControllers[idx];
+    [nav popToRootViewControllerAnimated:NO];
+    id root = nav.viewControllers.firstObject;
+    return [root conformsToProtocol:@protocol(QBDIListPage)] ? root : nil;
+}
+
+- (void)showAdd {
+    UIViewController *host = self.host;
+    if (host == nil) return;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"新增" message:nil
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"创建新的 Tracer"
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [[self rootForTab:0] beginCreate];
+        }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"导入 Tracer"
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [[self rootForTab:0] beginImport];
+        }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"创建新的 Hook"
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [[self rootForTab:1] beginCreate];
+        }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"导入 Hook"
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [[self rootForTab:1] beginImport];
+        }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     ac.popoverPresentationController.barButtonItem = self.anchor;
     [host presentViewController:ac animated:YES completion:nil];
 }

@@ -1,4 +1,6 @@
 #import <UIKit/UIKit.h>
 
-@interface RootListVC : UITableViewController
+#import "MoreMenu.h"
+
+@interface RootListVC : UITableViewController <QBDIListPage>
 @end
