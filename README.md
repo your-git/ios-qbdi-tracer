@@ -36,26 +36,29 @@
 
 ## 前提
 
-- macOS + Xcode Command Line Tools、[Theos](https://theos.dev)
-- 构建依赖需要 `cmake` / `ninja`(`brew install cmake ninja`)
-- 越狱设备(arm64,A7~A11 / iOS 15+),USB 连接
+- macOS + **完整 Xcode（含 iOS SDK）**，打开 Xcode 完成首次启动；仅 Command Line Tools 不够
+- 其余工具（git / cmake / ninja / python3 / ldid / xz / Theos）可由统一脚本检查并安装
+- 安装运行需要越狱设备(arm64,A7~A11 / iOS 15+)，编译打包无需连接手机
 - 完整前置工具表见 [docs/BUILD.md](docs/BUILD.md#前置工具)
 
 ## 快速开始
 
 ```sh
-# 1. 准备 QBDI/Dobby 依赖(只做一次),二选一:
-#    A. 从 GitHub Release 下载预编译 deps-arm64-*.tar.gz,解压到工程根目录(秒级,推荐)
-#    B. 自己编译(约 20-40 分钟):
-./scripts/build_deps_ios.sh
+# 1. 在工程根目录执行：安装缺失工具 + 下载编译官方依赖 + 生成两个 deb
+./scripts/setup_and_build.sh --release
 
-# 2. 编译打包(一键出 rootful + rootless 两个 deb)
-export THEOS=/path/to/theos
-./scripts/build_debs.sh            # debug 版
-# ./scripts/build_debs.sh --release  # 发布版(去符号)
-
-# 3. 安装:按你的越狱类型选对应的 deb(见下方"装哪个包")
+# 2. 安装:按你的越狱类型选对应的 deb(见下方"装哪个包")
 #    scp packages/对应架构.deb 到设备,用 Sileo / dpkg -i 安装
+```
+
+Homebrew 首次安装可能提示输入管理员密码；不要用 `sudo` 运行整个脚本。
+Theos 优先复用 `$THEOS`，未设置时使用 `~/theos`。依赖齐备后重复运行会复用，不重复下载编译。
+QBDI / Dobby 从各自官方 GitHub 仓库获取，与本项目的 GitHub Release 无关。
+
+```sh
+./scripts/setup_and_build.sh --check       # 只检测，不安装、不编译
+./scripts/setup_and_build.sh --setup-only  # 只安装工具和 Theos
+./scripts/setup_and_build.sh               # 准备环境并生成默认双包
 ```
 
 装完主屏出现 **QBDI Tracer** 图标。详见 [docs/BUILD.md](docs/BUILD.md)。

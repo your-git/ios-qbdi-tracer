@@ -6,10 +6,11 @@
 # 只需跑一次。之后在工程根目录 `make package` 即可。
 #
 # 前置工具(脚本只检查不自动安装):
-#   - Xcode Command Line Tools: xcode-select --install
-#   - git    : 随 Xcode CLT
+#   - 完整 Xcode + iOS SDK（仅 CLT 不够）
+#   - git    : 随 Xcode
 #   - cmake  : brew install cmake
 #   - ninja  : brew install ninja   (QBDI 自带静态 LLVM,tablegen 跨目录依赖只能用 ninja 编)
+# 自动安装缺失工具并打包请用: ./scripts/setup_and_build.sh --release
 #
 # 只构建 arm64(A7~A11 / iPhone 5s~X)。iOS 无 arm32 越狱环境,arm64e 需另行处理。
 #
@@ -32,12 +33,13 @@ need() {
         missing=1
     fi
 }
-need git   "随 Xcode CLT 附带,或 brew install git"
+need git   "随 Xcode 附带,或 brew install git"
 need cmake  "brew install cmake"
 need ninja  "brew install ninja"
 need python3 "随 Xcode CLT 附带,或 brew install python"
-if ! xcode-select -p >/dev/null 2>&1; then
-    echo "❌ 未安装 Xcode Command Line Tools  —— 安装: xcode-select --install"
+SDK="$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true)"
+if [ ! -d "$SDK" ] || ! xcrun --sdk iphoneos --find clang >/dev/null 2>&1; then
+    echo "❌ iOS SDK / clang 不可用。请安装完整 Xcode（仅 CLT 不够），或运行 ./scripts/setup_and_build.sh"
     missing=1
 fi
 if [ "$missing" -ne 0 ]; then
@@ -55,7 +57,7 @@ echo "[2/3] 构建 QBDI(arm64,约 15-30 分钟,一次性) ..."
 if [ ! -d QBDI ]; then
     echo "    克隆 QBDI ..."
     git clone --depth 1 -b dev-next https://github.com/QBDI/QBDI.git || {
-        echo "❌ git clone QBDI 失败。检查网络或改用镜像: https://github.com.cnpmjs.org/QBDI/QBDI.git"
+        echo "❌ git clone QBDI 失败。请检查 GitHub 网络连接或终端代理配置（HTTPS_PROXY）。"
         exit 1
     }
 fi
@@ -90,7 +92,7 @@ echo "[3/3] 构建 Dobby(arm64,约 1-2 分钟) ..."
 if [ ! -d Dobby ]; then
     echo "    克隆 Dobby ..."
     git clone --depth 1 -b master https://github.com/jmpews/Dobby.git || {
-        echo "❌ git clone Dobby 失败。检查网络或改用镜像: https://github.com.cnpmjs.org/jmpews/Dobby.git"
+        echo "❌ git clone Dobby 失败。请检查 GitHub 网络连接或终端代理配置（HTTPS_PROXY）。"
         exit 1
     }
 fi

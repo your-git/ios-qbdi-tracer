@@ -23,6 +23,13 @@ if [ -z "$THEOS" ]; then
     exit 1
 fi
 
+# deb 暂存必须支持 Unix 权限。工程放在 exFAT 外置盘时，目录可能固定为
+# 0700，dpkg 会拒绝打包；在系统临时目录暂存，不搬动工程或最终 packages。
+STAGE_ROOT="$(mktemp -d /tmp/ios-qbdi-package.XXXXXX)"
+trap 'rm -rf "$STAGE_ROOT"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 FINAL=""
 if [ "$1" = "--release" ] || [ "$1" = "-r" ]; then
     FINAL="FINALPACKAGE=1"
@@ -42,11 +49,11 @@ build_one() {
     make clean >/dev/null 2>&1 || true
     if [ "$scheme" = "rootless" ]; then
         THEOS_PACKAGE_SCHEME=rootless make package \
-            PACKAGE_VERSION="$BUILD_VERSION" $FINAL
+            THEOS_STAGING_DIR="$STAGE_ROOT/stage" PACKAGE_VERSION="$BUILD_VERSION" $FINAL
     else
         # 显式清空,避免继承外部环境里残留的 rootless 设置
         env -u THEOS_PACKAGE_SCHEME make package \
-            PACKAGE_VERSION="$BUILD_VERSION" $FINAL
+            THEOS_STAGING_DIR="$STAGE_ROOT/stage" PACKAGE_VERSION="$BUILD_VERSION" $FINAL
     fi
 
 

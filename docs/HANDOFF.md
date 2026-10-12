@@ -53,12 +53,22 @@
 
 | 文件 | 作用 |
 |---|---|
-| `Makefile` | aggregate:`SUBPROJECTS = Engine GUI` |
+| `Makefile` | aggregate:`SUBPROJECTS = Engine GUI`；`after-stage` 只清除打包暂存目录里的 `._*`，防止外置磁盘的 AppleDouble 文件干扰发布打包 |
 | `control` | 包名 `com.snk.qbditracer` |
+| `scripts/setup_and_build.sh` | macOS 统一入口：完整 Xcode / SDK 和网络检测、Homebrew 安装缺失工具、Theos 官方源码安装、依赖构建、双包打包。`--check` 只检测，`--setup-only` 只准备工具，`--release` 发布模式。默认 Theos 为 `~/theos`，不写 shell 配置、不部署手机 |
 | `scripts/build_deps_ios.sh` | 在本地 `third_party/` clone 并编译 QBDI+Dobby(arm64),装进 `Engine/lib`、`Engine/include`。只检查前置工具不自动装。可被 Release 预编译 deps 替代 |
-| `scripts/build_debs.sh` | 一键出 rootful(`iphoneos-arm`)+ rootless(`iphoneos-arm64`)两个 deb。两包共用 `YYMMDDHHMM` 版本/文件名；切 scheme 前自动 `make clean`,`--release` 出去符号版 |
+| `scripts/build_debs.sh` | 一键出 rootful(`iphoneos-arm`)+ rootless(`iphoneos-arm64`)两个 deb。两包共用 `YYMMDDHHMM` 版本/文件名；切 scheme 前自动 `make clean`,`--release` 出去符号版。使用 `/tmp` 暂存并自动清理，支持工程位于 exFAT 外置盘 |
 
 ## 常见修改任务
+
+### 环境入口维护
+
+新用户优先使用 `./scripts/setup_and_build.sh --release`。保持兼容 macOS 自带 Bash 3.2，
+特别注意 `set -u` 下空数组展开；Theos 复用检查还要覆盖 Logos / substrate 子模块。
+Xcode 需要完整安装和首次启动，CLT 不含本项目所需 iOS SDK。安装失败立即停止，
+不覆盖已有非空但不完整的 Theos 目录，也不自动更新用户已有工具。
+环境入口修改后运行 `python3 tests/setup_and_build_test.py`（隔离模拟，不安装真实工具），
+并用 `./scripts/setup_and_build.sh --check` 检查实际环境。
 
 ### A. 给 trace 条目加一个新字段(如 "maxInst")
 

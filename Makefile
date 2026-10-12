@@ -17,3 +17,9 @@ include $(THEOS)/makefiles/common.mk
 SUBPROJECTS = Engine GUI
 
 include $(THEOS)/makefiles/aggregate.mk
+
+# 非原生 macOS 文件系统可能自动生成 AppleDouble 文件。只清理 deb 暂存区，
+# 避免发布模式的 plist 转换把 ._* 当作真实配置；不触碰源码或用户配置。
+after-stage::
+	@find "$(THEOS_STAGING_DIR)" -type f -name '._*' -delete
+	@chmod -R a+rX "$(THEOS_STAGING_DIR)"
