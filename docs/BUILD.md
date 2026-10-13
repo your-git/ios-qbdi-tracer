@@ -21,6 +21,7 @@
 - 任一步失败都会停止，不会继续打包。网络检查只代表 GitHub 首页可达，不能保证所有
   源码、子模块和依赖下载一定成功；实际下载失败时查看对应工具输出。
 - 调用子脚本前会自动修复其 CRLF 换行，避免 `set: invalid option`；`--check` 不修改脚本。
+- 打包脚本在第一次调用 make 前会自动修复 `control` 的 CRLF / CR 换行，避免 Debian 包元数据被拒绝。
 - 不自动安装 Xcode、不安装到手机。Xcode 未就绪时先给出指引；完成后重跑同一命令。
 
 其它用法：
@@ -187,6 +188,7 @@ done
 
 | 报错 | 原因 / 修法 |
 |---|---|
+| `control file contains Windows/Macintosh line endings` | 根目录 `control` 带有 CRLF / CR。新打包脚本自动修复；旧版本可先运行 `perl -pi -e 's/\r\n?/\n/g' control` 再重新打包。`.gitattributes` 固定 `control` 为 LF |
 | `bad interpreter: /bin/bash^M: no such file or directory` | 脚本被转换成 Windows CRLF 换行。在工程根目录运行 `perl -pi -e 's/\r$//' scripts/*.sh`，然后重新执行脚本。仓库 `.gitattributes` 已为 `.sh` 指定 `eol=lf`，防止 Git 检出时转换换行 |
 | `._TracerEngine.plist: Property List error` | 外置磁盘上的 AppleDouble 元数据被误当成 plist；根 Makefile 的 `after-stage` 会在打包前清除暂存目录中的 `._*`，不改源文件 |
 | `'engine.h' file not found` / `'AppDelegate.h' file not found` | 子工程 CFLAGS 的 include 路径写错。`$(THEOS_PROJECT_DIR)` 指**聚合根目录**,不是子目录 → 要写 `$(THEOS_PROJECT_DIR)/Engine/src`、`.../GUI/src` |

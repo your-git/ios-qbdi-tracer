@@ -23,6 +23,13 @@ if [ -z "$THEOS" ]; then
     exit 1
 fi
 
+# Theos 在读取 Makefile 时就会解析 control，必须在第一次 make 前修复。
+# 同时处理 Windows CRLF 和旧 Macintosh CR；仅修复最终暂存文件太晚。
+if LC_ALL=C grep -q "$(printf '\r')" control; then
+    echo "修复 control 的 Windows / Macintosh 换行"
+    perl -pi -e 's/\r\n?/\n/g' control
+fi
+
 # deb 暂存必须支持 Unix 权限。工程放在 exFAT 外置盘时，目录可能固定为
 # 0700，dpkg 会拒绝打包；在系统临时目录暂存，不搬动工程或最终 packages。
 STAGE_ROOT="$(mktemp -d /tmp/ios-qbdi-package.XXXXXX)"

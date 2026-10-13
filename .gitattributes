@@ -1,2 +1,4 @@
 # Shell 脚本必须使用 Unix 换行，避免 core.autocrlf 将 shebang 变成 /bin/bash\r。
 *.sh text eol=lf
+# Debian 包元数据不能包含 Windows CRLF 或旧 Macintosh CR 换行。
+control text eol=lf

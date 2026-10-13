@@ -251,5 +251,44 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(self.children(), "")
 
 
+class BuildDebsLineEndingTest(unittest.TestCase):
+    def test_control_is_normalized_before_first_make(self):
+        control_lf = (ROOT / "control").read_bytes()
+        for ending in (b"\n", b"\r\n", b"\r"):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory(prefix="qbdi-control-test-") as temp:
+                base = Path(temp)
+                (base / "scripts").mkdir()
+                (base / "bin").mkdir()
+                shutil.copyfile(ROOT / "scripts/build_debs.sh", base / "scripts/build_debs.sh")
+                control = base / "control"
+                control.write_bytes(control_lf.replace(b"\n", ending))
+                make = base / "bin/make"
+                make.write_text("#!" + sys.executable + "\n" + r'''import os, pathlib, sys
+root = pathlib.Path.cwd()
+assert b"\r" not in (root / "control").read_bytes(), "control must be fixed before make"
+with (root / "make.log").open("a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\n")
+if "package" in sys.argv:
+    arch = "iphoneos-arm64" if os.environ.get("THEOS_PACKAGE_SCHEME") == "rootless" else "iphoneos-arm"
+    version = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("PACKAGE_VERSION="))
+    (root / "packages").mkdir(exist_ok=True)
+    (root / "packages" / f"com.snk.qbditracer_{version}_{arch}.deb").write_text("fixture")
+''')
+                make.chmod(0o755)
+                env = os.environ.copy()
+                env.update(PATH=str(base / "bin") + ":/usr/bin:/bin", THEOS=str(base / "theos"))
+                result = subprocess.run(["/bin/sh", str(base / "scripts/build_debs.sh"), "--release"],
+                                        env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(control.read_bytes(), control_lf)
+                self.assertEqual(len(list((base / "packages").glob("*.deb"))), 2)
+                calls = (base / "make.log").read_text().splitlines()
+                self.assertEqual(len(calls), 4)  # clean + package for each scheme
+                for line in calls:
+                    if "THEOS_STAGING_DIR=" in line:
+                        stage = line.split("THEOS_STAGING_DIR=", 1)[1].split()[0]
+                        self.assertFalse(Path(stage).parent.exists(), "temporary staging must be cleaned")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
