@@ -1,0 +1,2 @@
+# Shell 脚本必须使用 Unix 换行，避免 core.autocrlf 将 shebang 变成 /bin/bash\r。
+*.sh text eol=lf

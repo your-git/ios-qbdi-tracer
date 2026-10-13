@@ -208,6 +208,23 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stdout)
         self.assertEqual(self.children(), "deps\n")
 
+    def test_crlf_child_scripts_are_repaired_before_running(self):
+        for name in ("build_deps_ios.sh", "build_debs.sh"):
+            path = self.base / "scripts" / name
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        (self.base / "Engine/lib/arm64/libdobby.a").unlink()
+        self.assert_ok(self.run_script(["--release"]))
+        self.assertEqual(self.children(), "deps\nbuild:--release\n")
+        for name in ("build_deps_ios.sh", "build_debs.sh"):
+            self.assertNotIn(b"\r", (self.base / "scripts" / name).read_bytes())
+
+    def test_check_does_not_repair_crlf_scripts(self):
+        path = self.base / "scripts/build_debs.sh"
+        original = path.read_bytes().replace(b"\n", b"\r\n")
+        path.write_bytes(original)
+        self.assert_ok(self.run_script(["--check"]))
+        self.assertEqual(path.read_bytes(), original)
+
     def test_xcode_failure_stops_before_download(self):
         result = self.run_script(config={"first_launch_failure": True})
         self.assertNotEqual(result.returncode, 0)

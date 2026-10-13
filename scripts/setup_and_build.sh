@@ -197,6 +197,16 @@ deps_ready() {
         [ -s "$ROOT/$file" ] || return 1
     done
 }
+run_project_script() {
+    local script="$1"
+    shift
+    # Git / 编辑器可能把子脚本转换成 CRLF。入口修复后，也能自动修复子脚本。
+    if LC_ALL=C grep -q "$(printf '\r')" "$script"; then
+        echo "修复脚本的 Windows 换行: ${script##*/}"
+        perl -pi -e 's/\r$//' "$script"
+    fi
+    /bin/sh "$script" "$@"
+}
 if [ "$MODE" = check ]; then
     if deps_ready; then
         echo "✅ 已有 QBDI / Dobby 静态库和关键头文件"
@@ -213,12 +223,12 @@ else
         echo "✅ 复用项目内现有 QBDI / Dobby 依赖"
     else
         need_network
-        /bin/sh "$ROOT/scripts/build_deps_ios.sh"
+        run_project_script "$ROOT/scripts/build_deps_ios.sh"
         deps_ready || fail "依赖构建后仍缺少静态库或关键头文件，请检查构建输出。"
     fi
     if [ "$RELEASE" -eq 1 ]; then
-        /bin/sh "$ROOT/scripts/build_debs.sh" --release
+        run_project_script "$ROOT/scripts/build_debs.sh" --release
     else
-        /bin/sh "$ROOT/scripts/build_debs.sh"
+        run_project_script "$ROOT/scripts/build_debs.sh"
     fi
 fi
