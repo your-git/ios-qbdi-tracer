@@ -71,6 +71,7 @@ static NSMutableArray *mutableMods(id raw) {
 - (NSMutableDictionary *)newHook {
     return [@{
         @"id": [[NSUUID UUID] UUIDString],
+        @"addedAt": QBDINewAddedAt(),
         @"enabled": @YES,
         @"hookName": @"",
         @"bundleId": @"",
@@ -136,7 +137,9 @@ static NSString *sanitizeName(NSString *s) {
     NSString *appName = [hook[@"appName"] length] ? hook[@"appName"]
                                                   : hook[@"bundleId"];
     NSDateFormatter *df = [NSDateFormatter new];
-    df.dateFormat = @"yyyyMMddHHmm";
+    df.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+    df.calendar = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+    df.dateFormat = @"yyyyMMddHHmmss";
     NSString *ts = [df stringFromDate:[NSDate date]];
     NSString *fname = [NSString stringWithFormat:@"hook_%@%@.json",
                        sanitizeName(appName), ts];
@@ -163,12 +166,7 @@ static NSString *sanitizeName(NSString *s) {
             [paths addObject:[dir stringByAppendingPathComponent:n]];
         }
     }
-    [paths sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
-        NSDate *da = [fm attributesOfItemAtPath:a error:nil].fileModificationDate;
-        NSDate *db = [fm attributesOfItemAtPath:b error:nil].fileModificationDate;
-        return [db compare:da];
-    }];
-    return paths;
+    return QBDISortedFilePaths(paths, QBDIListSortNewestFirst);
 }
 
 /* 从一份导出里取出 hook 字典(支持 {version,type,hook} 包装或裸 hook)。 */

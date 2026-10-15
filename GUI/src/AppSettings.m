@@ -64,6 +64,10 @@ static NSString *trimmed(id value) {
     self.enabled = YES;
     self.logRoot = QBDIDefaultLogRoot();
     self.exportRoot = QBDIDefaultExportRoot();
+    self.traceSortMode = QBDIListSortOldestFirst;
+    self.hookSortMode = QBDIListSortOldestFirst;
+    self.traceImportSortMode = QBDIListSortNewestFirst;
+    self.hookImportSortMode = QBDIListSortNewestFirst;
 
     NSData *data = [NSData dataWithContentsOfFile:[self settingsPath]];
     if (data != nil) {
@@ -76,6 +80,10 @@ static NSString *trimmed(id value) {
             if (log.length) self.logRoot = log;
             NSString *exp = trimmed(cfg[@"exportRoot"]);
             if (exp.length) self.exportRoot = exp;
+            self.traceSortMode = QBDIValidatedSortMode(cfg[@"traceSortMode"]);
+            self.hookSortMode = QBDIValidatedSortMode(cfg[@"hookSortMode"]);
+            self.traceImportSortMode = QBDIValidatedSortModeWithDefault(cfg[@"traceImportSortMode"], QBDIListSortNewestFirst);
+            self.hookImportSortMode = QBDIValidatedSortModeWithDefault(cfg[@"hookImportSortMode"], QBDIListSortNewestFirst);
         }
         return;
     }
@@ -106,6 +114,10 @@ static NSString *trimmed(id value) {
         @"enabled": @(self.enabled),
         @"logRoot": self.logRoot ?: QBDIDefaultLogRoot(),
         @"exportRoot": self.exportRoot ?: QBDIDefaultExportRoot(),
+        @"traceSortMode": @(self.traceSortMode),
+        @"hookSortMode": @(self.hookSortMode),
+        @"traceImportSortMode": @(self.traceImportSortMode),
+        @"hookImportSortMode": @(self.hookImportSortMode),
     };
     if (![NSJSONSerialization isValidJSONObject:cfg]) return NO;
     NSData *data = [NSJSONSerialization dataWithJSONObject:cfg

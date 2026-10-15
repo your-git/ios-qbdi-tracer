@@ -4,7 +4,7 @@
  * 与 Trace 完全独立(ConfigStore 管 config.json,这里管 hooks.json)。
  *
  * 顶层: { hooks: [ hook... ] }
- * hook:  { id, enabled, hookName(可选), bundleId, appName, module, target,
+ * hook:  { id, enabled, hookName(可选), addedAt(加入时间,可选), bundleId, appName, module, target,
  *          delaySecs, maxHits(0=不限), mods: [ mod... ] }
  * mod:   { enabled, kind:"modify", type:"bytes|string|number",
  *          width(number 才有意义), expr, value }
@@ -30,7 +30,7 @@
 /* Hook 的导出目录:<exportRoot>/hook(按需创建)。 */
 - (NSString *)exportDir;
 
-/* 导出一条 hook。文件名 = hook_<appName净化><年月日时分>.json,
+/* 导出一条 hook。文件名 = hook_<appName净化><年月日时分秒>.json（yyyyMMddHHmmss）,
  * 内容 { version:1, type:"hook", hook:{...} }。成功返回完整路径,失败返回 nil。 */
 - (NSString *)exportHook:(NSDictionary *)hook error:(NSError **)err;
 

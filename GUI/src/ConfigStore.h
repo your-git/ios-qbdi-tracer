@@ -7,7 +7,7 @@
  * 引擎要能只读 settings.json 就判断出该不该干活。旧 config.json 里残留的
  * enabled 字段被忽略,AppSettings 首次启动时会把它迁走。
  *
- * item:  { id, enabled, traceName(可选), bundleId, appName, module, start, end, count,
+ * item:  { id, enabled, traceName(可选), addedAt(加入时间,可选), bundleId, appName, module, start, end, count,
  *          moduleOnly, delaySecs, logMask, maxInstructions(可选,0=不限制),
  *          triggerConsume: repeat|once|custom, triggers: [ trigger... ],
  *          mutations: [ { enabled, offset, reg, width, value, apply } ],
@@ -35,7 +35,7 @@
 - (NSString *)exportDir;
 
 /* 把一条 item 导出成 JSON 文件。成功返回落地的完整路径,失败返回 nil。
- * 文件名 = trace_<appName净化><年月日时分>.json —— 前缀是为了文件被挪出目录后
+ * 文件名 = trace_<appName净化><年月日时分秒>.json（yyyyMMddHHmmss）—— 前缀是为了文件被挪出目录后
  * 仍能一眼认出类型(导入时的类型判定另看文件内容,不依赖文件名)。 */
 - (NSString *)exportItem:(NSDictionary *)item error:(NSError **)err;
 

@@ -1,3 +1,4 @@
+#import "GUIFeatures.h"
 #import "MoreMenu.h"
 
 #import "AppSettings.h"
@@ -126,11 +127,13 @@
                                          handler:^(UIAlertAction *a) {
               [self showTriggerPolicy];
           }]];
+#if QBDI_SHOW_TRACE_MUTATIONS
     [ac addAction:[UIAlertAction actionWithTitle:@"Trace 内寄存器修改"
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) {
               [self showMutationHelp];
           }]];
+#endif
     [ac addAction:[UIAlertAction actionWithTitle:@"Hook 修改数据"
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) {
@@ -154,17 +157,24 @@
 
 - (void)showLogPath {
     AppSettings *s = [AppSettings shared];
+    NSString *root = s.logRoot ?: QBDIDefaultLogRoot();
+    NSString *traceDir = [root stringByAppendingPathComponent:QBDI_TRACE_LOG_SUBDIR];
+    NSString *hookDir = [root stringByAppendingPathComponent:QBDI_HOOK_LOG_SUBDIR];
     NSString *message = [NSString stringWithFormat:
-        @"当前日志根目录:\n%@\n\n"
-        @"Trace 日志:%@/%@/trace_<年月日时分>.log\n"
-        @"Hook 日志:%@/%@/hook_<年月日时分>.log\n\n"
-        @"例:trace_2611131630.log(26年11月13日16:30)。年份取两位。\n\n"
-        @"每次启动目标 App 会按当时的时间生成新日志文件;同一次运行里 Trace 和 "
-        @"Hook 的时间戳相同,方便对照。目录不存在时会自动创建。\n\n"
-        @"日志根目录可以在「更多 → 设置」里修改,改完需重开目标 App 才生效。\n\n"
-        @"用 Filza 或 SSH 打开查看。",
-        s.logRoot, s.logRoot, QBDI_TRACE_LOG_SUBDIR,
-        s.logRoot, QBDI_HOOK_LOG_SUBDIR];
+        @"当前日志根目录\n%@\n\n"
+        @"Trace 日志\n目录：%@\n文件：trace_<年月日时分>.log\n\n"
+        @"Hook 日志\n目录：%@\n文件：hook_<年月日时分>.log\n\n"
+        @"日志时间戳使用两位年份，精确到分钟。例：trace_2610131230.log 表示 "
+        @"2026 年 10 月 13 日 12:30。\n\n"
+        @"同一个目标 App 进程的 Trace / Hook 共用时间戳。日志以追加方式写入；"
+        @"同一分钟内重启目标 App，可能继续写入同名文件。\n\n"
+        @"如何查看\n用 Filza 打开上面的目录，或通过 SSH 查看 .log 文件。"
+        @"运行诊断也会输出到系统控制台，可搜索 [ios-qbdi-tracer]。\n\n"
+        @"如何修改\n在「更多 → 设置 → 日志根目录」修改并保存，然后完全关闭并重新打开目标 App。"
+        @"日志子目录会按需创建。\n\n"
+        @"没有找到日志？\n先检查插件总开关和对应条目是否启用、目标 App 是否匹配，"
+        @"再重开目标 App。若仍没有日志，请确认日志根目录可写，并查看系统控制台的错误信息。",
+        root, traceDir, hookDir];
     [self alert:@"日志输出位置" message:message];
 }
 

@@ -258,6 +258,14 @@ after N filtered calls`。
 
 ### settings.json
 
+GUI 还保存独立的 `traceSortMode` / `hookSortMode`：0=名称 A–Z，1=名称 Z–A，
+2=加入时间新到旧，3=旧到新（缺省）。引擎忽略这些展示字段。
+条目的可选 `addedAt` 是加入本机软件的 Unix 时间秒数，用于 GUI 排序，编辑不更新；
+复制和导入产生新时间。历史条目没有时间时以原数组顺序兜底，且排在有时间的新条目前。
+排序只生成显示视图，不重排配置数组。
+文件导入页的 `traceImportSortMode` / `hookImportSortMode` 使用相同枚举，缺省 2；
+名称取文件名，时间取文件修改时间，各分页独立记住选择，与主页排序互不影响。
+
 ```json
 {
   "enabled": true,                              // 总开关(Trace/Hook 共用)
@@ -382,7 +390,7 @@ after N filtered calls`。
 
 ## 6.5 导出 / 导入
 
-- **导出**:trace 条目左滑「导出」→ `{"version":1,"item":{...}}` 写到 `<exportRoot>/trace/`,文件名 `trace_<appName净化><年月日时分>.json`;hook 条目左滑「导出」→ `{"version":1,"type":"hook","hook":{...}}` 写到 `<exportRoot>/hook/`,文件名 `hook_<...>.json`。成功弹框显示实际落地完整路径。`exportRoot` 默认 `<Documents>/ios-qbdi-tracer-config-json`,可在设置页改。
+- **导出**:trace 条目左滑「导出」→ `{"version":1,"item":{...}}` 写到 `<exportRoot>/trace/`,文件名 `trace_<appName净化><年月日时分秒>.json`（`yyyyMMddHHmmss`）;hook 条目左滑「导出」→ `{"version":1,"type":"hook","hook":{...}}` 写到 `<exportRoot>/hook/`,文件名 `hook_<appName净化><年月日时分秒>.json`。成功弹框显示实际落地完整路径。`exportRoot` 默认 `<Documents>/ios-qbdi-tracer-config-json`,可在设置页改。
 - **取出**:App 的 Info.plist 开了 `UIFileSharingEnabled`+`LSSupportsOpeningDocumentsInPlace`,用 Finder 连手机 → 文件共享 → QBDI Tracer 拖出。
 - **导入**(+ → 导入,或「更多 → 新增」):`ImportVC` 底部 **Trace|Hook 分页**,列各自导出目录 +**旧版 Documents 根**下的 .json(升级后不会"看起来全丢了")。点选文件时按**内容真实类型**(`HookStore detectType`:看 `type` 字段/包装 key/特征字段)导入 —— 选中的文件若与当前分页不符,自动导到正确的一类并提示。都会重生 id、enabled=YES。
 - **兼容**:trace 接受 `{version,item}` 或裸 item;hook 接受 `{version,type,hook}` 或裸 hook。

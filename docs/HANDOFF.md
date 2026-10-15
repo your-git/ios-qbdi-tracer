@@ -22,6 +22,25 @@
 
 ### GUI/(控制 App,主屏图标)
 
+列表排序由 `ListSort.{h,m}`（拼音比较 / 加入时间 / 稳定排序）和
+`SortedListVC.{h,m}`（右上角排序菜单 / 排序显示快照）共用。显示数组仍引用原条目对象，
+不得按显示行号访问 ConfigStore / HookStore 的源数组，也不得排序源数组（会改变引擎加载顺序）。
+新增 / 复制 / 导入使用 Unix 秒数 `addedAt`；编辑、命名、启停不改变它。导入不继承来源文件
+的时间，而是使用本次加入时间。旧条目缺失 / 无效时间视为历史条目，并按原数组先后排序，
+无法恢复真实历史时间。排序选择 `traceSortMode` / `hookSortMode` 保存在 settings.json，
+缺省为旧到新，保存失败会恢复原选择。
+
+文件导入页也使用 `QBDISortedFilePaths`，复用拼音 / 自然名称比较，时间取文件修改时间
+（与列表显示时间一致，不是文件 JSON 中的加入时间）。`traceImportSortMode` / `hookImportSortMode`
+单独保存于 settings.json，缺省文件新到旧，不影响主页排序。切换分页会重载各自的排序。
+文件属性缺失时按无时间处理，不让比较器对 nil 日期崩溃；排序后点击仍使用完整文件路径。
+
+`GUIFeatures.h` 的 `QBDI_SHOW_TRACE_MUTATIONS=0` 隐藏 Trace 寄存器修改区域和对应帮助入口，
+`TraceFormSection` 把显示 section 4 映射到原 watch section 5，避免空白分组。
+恢复时设为 1；MutationEditVC、配置读写 / 校验、引擎执行都保留，Hook 不受影响。
+回归用 `./scripts/test_list_sort.sh`（实际排序和配置实现，ASan / UBSan，配置目录重定向到临时目录）
+以及 `./scripts/test_watch_expr.sh`。
+
 | 文件 | 行数 | 作用 |
 |---|---|---|
 | `entry.m` | 10 | `UIApplicationMain` |
@@ -60,6 +79,10 @@
 | `scripts/build_debs.sh` | 一键出 rootful(`iphoneos-arm`)+ rootless(`iphoneos-arm64`)两个 deb。两包共用 `YYMMDDHHMM` 版本/文件名；首次 make 前修复 control 的 CRLF / CR；切 scheme 前自动 `make clean`,`--release` 出去符号版。使用 `/tmp` 暂存并自动清理，支持工程位于 exFAT 外置盘 |
 
 ## 常见修改任务
+
+导出配置文件名使用 `trace_` / `hook_` + 净化的 App 名称 + `yyyyMMddHHmmss.json`，
+例如 `trace_TikTok20261013123045.json`。日志文件仍使用两位年份、分钟精度；
+帮助中的日志路径取当前设置，说明同名日志追加写入及查看 / 修改 / 排错方式。
 
 ### 环境入口维护
 

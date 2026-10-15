@@ -23,6 +23,7 @@ static BOOL traceEnabled(NSDictionary *item) {
 
 @interface RootListVC ()
 - (BOOL)persist;
+- (BOOL)duplicateItem:(NSDictionary *)src;
 - (void)notify:(NSString *)msg;
 - (void)reloadItem:(NSMutableDictionary *)item;
 - (void)renameItem:(NSMutableDictionary *)item
@@ -42,14 +43,17 @@ static BOOL traceEnabled(NSDictionary *item) {
                              action:@selector(plusTapped)];
     /* 左上角「更多」:帮助、设置、页面切换都在里面(见 MoreMenu.m) */
     self.navigationItem.leftBarButtonItem = MoreMenuBarButton(self);
+    [self installSortButton];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    [self.tableView reloadData];
+    [self reloadEntries];
 }
 
 - (ConfigStore *)store { return [ConfigStore shared]; }
+- (NSArray<NSMutableDictionary *> *)sourceEntries { return [self store].items; }
+
 
 #pragma mark - + 菜单:创建 / 导入
 
@@ -122,7 +126,7 @@ static BOOL traceEnabled(NSDictionary *item) {
 - (void)importFromFile {
     ImportVC *vc = [ImportVC new];
     __weak typeof(self) weakSelf = self;
-    vc.onImported = ^{ [weakSelf.tableView reloadData]; };
+    vc.onImported = ^{ [weakSelf reloadEntries]; };
     [self.navigationController pushViewController:vc animated:YES];
 }
 
@@ -147,9 +151,10 @@ static BOOL traceEnabled(NSDictionary *item) {
               }
               [[self store].items addObject:item];
               if ([[self store] save]) {
-                  [self.tableView reloadData];
+                  [self reloadEntries];
                   [self notify:@"导入成功"];
               } else {
+                  [[self store].items removeObjectIdenticalTo:item];
                   [self notify:@"保存失败(检查权限)"];
               }
           }]];
@@ -173,7 +178,7 @@ static BOOL traceEnabled(NSDictionary *item) {
 - (NSInteger)tableView:(UITableView *)tableView
     numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return 1;
-    return (NSInteger)[self store].items.count;
+    return (NSInteger)self.displayedEntries.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView
@@ -202,7 +207,7 @@ static BOOL traceEnabled(NSDictionary *item) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                       reuseIdentifier:@"item"];
     }
-    NSDictionary *it = [self store].items[indexPath.row];
+    NSDictionary *it = self.displayedEntries[indexPath.row];
     NSString *app = [it[@"appName"] length] ? it[@"appName"] : it[@"bundleId"];
     NSString *target = [NSString stringWithFormat:@"%@  %@",
                         app ?: @"?", it[@"module"] ?: @""];
@@ -246,7 +251,7 @@ static BOOL traceEnabled(NSDictionary *item) {
     if (indexPath.section == 0) return;
 
     /* 点击行 = 编辑该条目 */
-    NSMutableDictionary *it = [self store].items[indexPath.row];
+    NSMutableDictionary *it = self.displayedEntries[indexPath.row];
     TraceEditVC *edit = [[TraceEditVC alloc] initWithItem:it isNew:NO];
     [self.navigationController pushViewController:edit animated:YES];
 }
@@ -256,7 +261,7 @@ static BOOL traceEnabled(NSDictionary *item) {
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
     leadingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == 0) return nil;
-    NSMutableDictionary *it = [self store].items[indexPath.row];
+    NSMutableDictionary *it = self.displayedEntries[indexPath.row];
     BOOL on = traceEnabled(it);
     __weak typeof(self) weakSelf = self;
     UIContextualAction *toggle = [UIContextualAction
@@ -301,21 +306,20 @@ static BOOL traceEnabled(NSDictionary *item) {
     if (indexPath.section == 0) return nil;
 
     __weak typeof(self) weakSelf = self;
-    NSMutableDictionary *it = [self store].items[indexPath.row];
+    NSMutableDictionary *it = self.displayedEntries[indexPath.row];
     UIContextualAction *del = [UIContextualAction
         contextualActionWithStyle:UIContextualActionStyleDestructive
                             title:@"删除"
                           handler:^(UIContextualAction *a, UIView *v,
                                     void (^done)(BOOL)) {
-              [weakSelf confirmDeleteAt:indexPath done:done];
+              [weakSelf confirmDeleteItem:it done:done];
           }];
     UIContextualAction *copy = [UIContextualAction
         contextualActionWithStyle:UIContextualActionStyleNormal
                             title:@"复制"
                           handler:^(UIContextualAction *a, UIView *v,
                                     void (^done)(BOOL)) {
-              [weakSelf duplicateAt:indexPath];
-              done(YES);
+              done([weakSelf duplicateItem:it]);
           }];
     copy.backgroundColor = [UIColor systemBlueColor];
     UIContextualAction *exp = [UIContextualAction
@@ -323,7 +327,7 @@ static BOOL traceEnabled(NSDictionary *item) {
                             title:@"导出"
                           handler:^(UIContextualAction *a, UIView *v,
                                     void (^done)(BOOL)) {
-              [weakSelf exportAt:indexPath];
+              [weakSelf exportItem:it];
               done(YES);
           }];
     exp.backgroundColor = [UIColor systemGreenColor];
@@ -390,15 +394,10 @@ static BOOL traceEnabled(NSDictionary *item) {
 }
 
 - (void)reloadItem:(NSMutableDictionary *)item {
-    NSUInteger row = [[self store].items indexOfObjectIdenticalTo:item];
-    if (row == NSNotFound) return;
-    NSIndexPath *ip = [NSIndexPath indexPathForRow:(NSInteger)row inSection:1];
-    [self.tableView reloadRowsAtIndexPaths:@[ ip ]
-                           withRowAnimation:UITableViewRowAnimationAutomatic];
+    [self reloadEntries];
 }
 
-- (void)exportAt:(NSIndexPath *)indexPath {
-    NSDictionary *item = [self store].items[indexPath.row];
+- (void)exportItem:(NSDictionary *)item {
     NSError *err = nil;
     NSString *path = [[self store] exportItem:item error:&err];
     if (path == nil) {
@@ -417,10 +416,10 @@ static BOOL traceEnabled(NSDictionary *item) {
     [self presentViewController:ac animated:YES completion:nil];
 }
 
-- (void)duplicateAt:(NSIndexPath *)indexPath {
-    NSDictionary *src = [self store].items[indexPath.row];
+- (BOOL)duplicateItem:(NSDictionary *)src {
     NSMutableDictionary *copy = [src mutableCopy];
     copy[@"id"] = [[NSUUID UUID] UUIDString];
+    copy[@"addedAt"] = QBDINewAddedAt();
     /* watches 也深拷 */
     NSMutableArray *mw = [NSMutableArray array];
     for (NSDictionary *w in src[@"watches"]) {
@@ -437,13 +436,14 @@ static BOOL traceEnabled(NSDictionary *item) {
         [mm addObject:[mutation mutableCopy]];
     }
     copy[@"mutations"] = mm;
-    [[self store].items insertObject:copy atIndex:indexPath.row + 1];
-    [self persist];
-    [self.tableView reloadData];
+    [[self store].items addObject:copy];
+    BOOL saved = [self persist];
+    if (!saved) [[self store].items removeObjectIdenticalTo:copy];
+    [self reloadEntries];
+    return saved;
 }
 
-- (void)confirmDeleteAt:(NSIndexPath *)indexPath done:(void (^)(BOOL))done {
-    NSDictionary *it = [self store].items[indexPath.row];
+- (void)confirmDeleteItem:(NSMutableDictionary *)it done:(void (^)(BOOL))done {
     NSString *app = [it[@"appName"] length] ? it[@"appName"] : it[@"bundleId"];
     NSString *name = traceName(it);
     NSString *what = name.length > 0
@@ -462,10 +462,14 @@ static BOOL traceEnabled(NSDictionary *item) {
     [ac addAction:[UIAlertAction actionWithTitle:@"删除"
                                            style:UIAlertActionStyleDestructive
                                          handler:^(UIAlertAction *a) {
-              [[self store].items removeObjectAtIndex:indexPath.row];
-              [self persist];
-              [self.tableView reloadData];
-              done(YES);
+              NSMutableArray *items = [self store].items;
+              NSUInteger index = [items indexOfObjectIdenticalTo:it];
+              if (index == NSNotFound) { done(NO); return; }
+              [items removeObjectAtIndex:index];
+              BOOL saved = [self persist];
+              if (!saved) [items insertObject:it atIndex:index];
+              [self reloadEntries];
+              done(saved);
           }]];
     [self presentViewController:ac animated:YES completion:nil];
 }

@@ -19,6 +19,10 @@ static BOOL hookEnabled(NSDictionary *hook) {
     return [raw isKindOfClass:[NSNumber class]] ? [raw boolValue] : YES;
 }
 
+@interface HookListVC ()
+- (BOOL)duplicateItem:(NSDictionary *)src;
+@end
+
 @implementation HookListVC
 
 - (void)viewDidLoad {
@@ -29,14 +33,18 @@ static BOOL hookEnabled(NSDictionary *hook) {
         initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
                              target:self
                              action:@selector(plusTapped)];
+    [self installSortButton];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    [self.tableView reloadData];
+    [self reloadEntries];
 }
 
 - (HookStore *)store { return [HookStore shared]; }
+- (NSArray<NSMutableDictionary *> *)sourceEntries { return [self store].hooks; }
+- (BOOL)isHookList { return YES; }
+
 
 #pragma mark - + 菜单
 
@@ -78,7 +86,7 @@ static BOOL hookEnabled(NSDictionary *hook) {
             ImportVC *vc = [ImportVC new];
             vc.initialHookPage = YES; /* 默认进 Hook 分页 */
             __weak typeof(self) weakSelf = self;
-            vc.onImported = ^{ [weakSelf.tableView reloadData]; };
+            vc.onImported = ^{ [weakSelf reloadEntries]; };
             [self.navigationController pushViewController:vc animated:YES];
         }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"粘贴 JSON"
@@ -104,9 +112,10 @@ static BOOL hookEnabled(NSDictionary *hook) {
             if (hook == nil) { [self notify:err.localizedDescription ?: @"配置格式无效"]; return; }
             [[self store].hooks addObject:hook];
             if ([[self store] save]) {
-                [self.tableView reloadData];
+                [self reloadEntries];
                 [self notify:@"导入成功"];
             } else {
+                [[self store].hooks removeObjectIdenticalTo:hook];
                 [self notify:@"保存失败(检查权限)"];
             }
         }]];
@@ -131,7 +140,7 @@ static BOOL hookEnabled(NSDictionary *hook) {
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return 1;
-    return (NSInteger)[self store].hooks.count;
+    return (NSInteger)self.displayedEntries.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -152,7 +161,7 @@ static BOOL hookEnabled(NSDictionary *hook) {
     if (cell == nil) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"hook"];
     }
-    NSDictionary *h = [self store].hooks[ip.row];
+    NSDictionary *h = self.displayedEntries[ip.row];
     NSString *app = [h[@"appName"] length] ? h[@"appName"] : h[@"bundleId"];
     NSInteger nmods = [h[@"mods"] isKindOfClass:[NSArray class]] ? [h[@"mods"] count] : 0;
     NSString *target = [NSString stringWithFormat:@"%@  %@ @ %@",
@@ -187,7 +196,7 @@ static BOOL hookEnabled(NSDictionary *hook) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tableView deselectRowAtIndexPath:ip animated:YES];
     if (ip.section == 0) return;
-    NSMutableDictionary *h = [self store].hooks[ip.row];
+    NSMutableDictionary *h = self.displayedEntries[ip.row];
     HookEditVC *edit = [[HookEditVC alloc] initWithHook:h isNew:NO];
     [self.navigationController pushViewController:edit animated:YES];
 }
@@ -197,7 +206,7 @@ static BOOL hookEnabled(NSDictionary *hook) {
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
     leadingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
     if (ip.section == 0) return nil;
-    NSMutableDictionary *h = [self store].hooks[ip.row];
+    NSMutableDictionary *h = self.displayedEntries[ip.row];
     BOOL on = hookEnabled(h);
     __weak typeof(self) weakSelf = self;
     UIContextualAction *toggle = [UIContextualAction
@@ -229,19 +238,19 @@ static BOOL hookEnabled(NSDictionary *hook) {
     trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
     if (ip.section == 0) return nil;
     __weak typeof(self) weakSelf = self;
-    NSMutableDictionary *h = [self store].hooks[ip.row];
+    NSMutableDictionary *h = self.displayedEntries[ip.row];
     UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
         title:@"删除" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
-            [weakSelf confirmDeleteAt:ip done:done];
+            [weakSelf confirmDeleteItem:h done:done];
         }];
     UIContextualAction *copy = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
         title:@"复制" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
-            [weakSelf duplicateAt:ip]; done(YES);
+            done([weakSelf duplicateItem:h]);
         }];
     copy.backgroundColor = [UIColor systemBlueColor];
     UIContextualAction *exp = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
         title:@"导出" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
-            [weakSelf exportAt:ip]; done(YES);
+            [weakSelf exportItem:h]; done(YES);
         }];
     exp.backgroundColor = [UIColor systemGreenColor];
     UIContextualAction *rename = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
@@ -285,14 +294,10 @@ static BOOL hookEnabled(NSDictionary *hook) {
 }
 
 - (void)reloadRow:(NSMutableDictionary *)hook {
-    NSUInteger row = [[self store].hooks indexOfObjectIdenticalTo:hook];
-    if (row == NSNotFound) return;
-    [self.tableView reloadRowsAtIndexPaths:@[ [NSIndexPath indexPathForRow:(NSInteger)row inSection:1] ]
-                          withRowAnimation:UITableViewRowAnimationAutomatic];
+    [self reloadEntries];
 }
 
-- (void)exportAt:(NSIndexPath *)ip {
-    NSDictionary *hook = [self store].hooks[ip.row];
+- (void)exportItem:(NSDictionary *)hook {
     NSError *err = nil;
     NSString *path = [[self store] exportHook:hook error:&err];
     if (path == nil) { [self notify:err.localizedDescription ?: @"导出失败"]; return; }
@@ -305,20 +310,24 @@ static BOOL hookEnabled(NSDictionary *hook) {
     [self presentViewController:ac animated:YES completion:nil];
 }
 
-- (void)duplicateAt:(NSIndexPath *)ip {
-    NSDictionary *src = [self store].hooks[ip.row];
+- (BOOL)duplicateItem:(NSDictionary *)src {
     NSMutableDictionary *copy = [src mutableCopy];
     copy[@"id"] = [[NSUUID UUID] UUIDString];
+    copy[@"addedAt"] = QBDINewAddedAt();
     NSMutableArray *mm = [NSMutableArray array];
     for (NSDictionary *m in src[@"mods"]) [mm addObject:[m mutableCopy]];
     copy[@"mods"] = mm;
-    [[self store].hooks insertObject:copy atIndex:ip.row + 1];
-    if (![[self store] save]) [self notify:@"保存失败(检查配置目录权限)"];
-    [self.tableView reloadData];
+    [[self store].hooks addObject:copy];
+    BOOL saved = [[self store] save];
+    if (!saved) {
+        [[self store].hooks removeObjectIdenticalTo:copy];
+        [self notify:@"保存失败(检查配置目录权限)"];
+    }
+    [self reloadEntries];
+    return saved;
 }
 
-- (void)confirmDeleteAt:(NSIndexPath *)ip done:(void (^)(BOOL))done {
-    NSDictionary *h = [self store].hooks[ip.row];
+- (void)confirmDeleteItem:(NSMutableDictionary *)h done:(void (^)(BOOL))done {
     NSString *app = [h[@"appName"] length] ? h[@"appName"] : h[@"bundleId"];
     NSString *name = hookName(h);
     NSString *what = name.length > 0
@@ -331,10 +340,17 @@ static BOOL hookEnabled(NSDictionary *hook) {
         handler:^(UIAlertAction *a) { done(NO); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
         handler:^(UIAlertAction *a) {
-            [[self store].hooks removeObjectAtIndex:ip.row];
-            if (![[self store] save]) [self notify:@"保存失败(检查配置目录权限)"];
-            [self.tableView reloadData];
-            done(YES);
+            NSMutableArray *hooks = [self store].hooks;
+            NSUInteger index = [hooks indexOfObjectIdenticalTo:h];
+            if (index == NSNotFound) { done(NO); return; }
+            [hooks removeObjectAtIndex:index];
+            BOOL saved = [[self store] save];
+            if (!saved) {
+                [hooks insertObject:h atIndex:index];
+                [self notify:@"保存失败(检查配置目录权限)"];
+            }
+            [self reloadEntries];
+            done(saved);
         }]];
     [self presentViewController:ac animated:YES completion:nil];
 }

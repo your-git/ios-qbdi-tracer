@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 APPLICATION_NAME = TracerGUI
 
 TracerGUI_FILES = entry.m src/AppDelegate.m src/AppSettings.m src/ConfigStore.m \
-                  src/HookStore.m \
+                  src/HookStore.m src/ListSort.m src/SortedListVC.m \
                   src/NavController.m src/FormEditVC.m \
                   src/ExprInput.m src/HexValue.m \
                   src/MoreMenu.m src/SettingsVC.m \
@@ -14,7 +14,7 @@ TracerGUI_FILES = entry.m src/AppDelegate.m src/AppSettings.m src/ConfigStore.m 
                   src/TraceEditVC.m src/TriggerEditVC.m src/MutationEditVC.m \
                   src/WatchEditVC.m src/HookEditVC.m src/HookModEditVC.m \
                   src/ImportVC.m
-TracerGUI_FRAMEWORKS = UIKit Foundation
+TracerGUI_FRAMEWORKS = UIKit Foundation CoreFoundation
 TracerGUI_CFLAGS = -fobjc-arc -I$(THEOS_PROJECT_DIR)/GUI/src
 # LSApplicationWorkspace 等私有 API:越狱 App 直接用,无需额外链接
 TracerGUI_CODESIGN_FLAGS = -Sentitlements.plist

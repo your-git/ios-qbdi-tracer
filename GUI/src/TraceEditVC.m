@@ -1,3 +1,5 @@
+#import "GUIFeatures.h"
+#import "ListSort.h"
 #import "TraceEditVC.h"
 #import "ConfigStore.h"
 #import "ExprInput.h"
@@ -10,6 +12,10 @@
 
 #define TRACE_DEFAULT_LOGMASK 17
 #define TRACE_MIN_RANGE 0x10
+
+static NSInteger TraceFormSection(NSInteger visibleSection) {
+    return !QBDI_SHOW_TRACE_MUTATIONS && visibleSection >= 4 ? visibleSection + 1 : visibleSection;
+}
 
 static BOOL TraceCountTextValid(NSString *text, NSInteger *value) {
     if (![text isKindOfClass:[NSString class]] || text.length == 0) return NO;
@@ -145,12 +151,14 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
     [self.tableView reloadData];
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 6; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return QBDI_SHOW_TRACE_MUTATIONS ? 6 : 5; }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    section = TraceFormSection(section);
     return @[ @"目标 App", @"模块与地址(十六进制)", @"选项", @"触发条件(可选)",
               @"Trace 内寄存器修改", @"监视(watch)" ][section];
 }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    section = TraceFormSection(section);
     if (section == 1) return @"结束地址至少要比起始地址大 0x10。";
     if (section == 2) return @"Trace 次数允许 1–16 次。";
     if (section == 3) return @"没有条件时为无条件 Trace；有多条时，满足任意一条即可。相同判断地址共享一个 Hook。";
@@ -158,6 +166,7 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
     return nil;
 }
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    section = TraceFormSection(section);
     if (section == 0) return 1;
     if (section == 1) return 3;
     if (section == 2) return 3;
@@ -182,19 +191,19 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)ip {
-    if (ip.section == 0) {
+    if (TraceFormSection(ip.section) == 0) {
         UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
         c.textLabel.text = @"App";
         c.detailTextLabel.text = [self.item[@"appName"] length] ? self.item[@"appName"] : self.item[@"bundleId"];
         c.selectionStyle = UITableViewCellSelectionStyleNone;
         return c;
     }
-    if (ip.section == 1) {
+    if (TraceFormSection(ip.section) == 1) {
         return [self field:@[ @"module", @"start", @"end" ][ip.row]
                       label:@[ @"模块名", @"起始地址", @"结束地址" ][ip.row]
                 placeholder:@[ @"ModuleName", @"0x...", @"0x..." ][ip.row] numeric:NO];
     }
-    if (ip.section == 2) {
+    if (TraceFormSection(ip.section) == 2) {
         if (ip.row == 0) return [self field:@"delaySecs" label:@"延迟(秒)" placeholder:@"0" numeric:YES];
         if (ip.row == 1) return [self field:@"count" label:@"Trace 次数" placeholder:@"1–16" numeric:YES];
         UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
@@ -206,7 +215,7 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
         c.accessoryView = sw;
         return c;
     }
-    if (ip.section == 3) {
+    if (TraceFormSection(ip.section) == 3) {
         NSMutableArray *triggers = self.item[@"triggers"];
         if (ip.row == 0) {
             UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
@@ -243,7 +252,7 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return c;
     }
-    if (ip.section == 4) {
+    if (TraceFormSection(ip.section) == 4) {
         NSMutableArray *mutations = self.item[@"mutations"];
         if (ip.row == (NSInteger)mutations.count) {
             UITableViewCell *cell = [[UITableViewCell alloc]
@@ -347,7 +356,7 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tableView deselectRowAtIndexPath:ip animated:YES];
-    if (ip.section == 3) {
+    if (TraceFormSection(ip.section) == 3) {
         NSMutableArray *triggers = self.item[@"triggers"];
         if (ip.row == 0) { [self pickPolicy:[tableView cellForRowAtIndexPath:ip]]; return; }
         BOOL adding = ip.row == (NSInteger)triggers.count + 1;
@@ -374,7 +383,7 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
         [self.navigationController pushViewController:vc animated:YES];
         return;
     }
-    if (ip.section == 4) {
+    if (TraceFormSection(ip.section) == 4) {
         NSMutableArray *mutations = self.item[@"mutations"];
         BOOL adding = ip.row == (NSInteger)mutations.count;
         NSMutableDictionary *mutation = adding
@@ -391,7 +400,7 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
         [self.navigationController pushViewController:vc animated:YES];
         return;
     }
-    if (ip.section != 5) return;
+    if (TraceFormSection(ip.section) != 5) return;
     NSMutableArray *watches = self.item[@"watches"];
     BOOL adding = ip.row == (NSInteger)watches.count;
     NSMutableDictionary *watch = adding
@@ -407,9 +416,9 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
     NSMutableArray *array = nil;
     NSInteger index = -1;
-    if (ip.section == 3) { array = self.item[@"triggers"]; index = ip.row - 1; }
-    else if (ip.section == 4) { array = self.item[@"mutations"]; index = ip.row; }
-    else if (ip.section == 5) { array = self.item[@"watches"]; index = ip.row; }
+    if (TraceFormSection(ip.section) == 3) { array = self.item[@"triggers"]; index = ip.row - 1; }
+    else if (TraceFormSection(ip.section) == 4) { array = self.item[@"mutations"]; index = ip.row; }
+    else if (TraceFormSection(ip.section) == 5) { array = self.item[@"watches"]; index = ip.row; }
     if (index < 0 || index >= (NSInteger)array.count) return nil;
     __weak typeof(self) weakSelf = self;
     UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
@@ -530,7 +539,10 @@ static NSString *MutationRegDisplay(NSDictionary *mutation) {
     if (![self validateMutations]) return;
     ConfigStore *store = [ConfigStore shared];
     BOOL appended = self.isNew;
-    if (appended) [store.items addObject:self.item];
+    if (appended) {
+        self.item[@"addedAt"] = QBDINewAddedAt();
+        [store.items addObject:self.item];
+    }
     if (![store save]) {
         if (appended) [store.items removeObjectIdenticalTo:self.item];
         [self alert:@"错误" message:@"保存失败(检查配置目录权限)。"]; return;

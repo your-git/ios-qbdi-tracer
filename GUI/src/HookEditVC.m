@@ -1,3 +1,4 @@
+#import "ListSort.h"
 #import "HookEditVC.h"
 
 #import "ExprInput.h"
@@ -302,7 +303,10 @@ static NSString *modTypeName(NSDictionary *mod) {
 
     HookStore *store = [HookStore shared];
     BOOL appended = self.isNew;
-    if (appended) [store.hooks addObject:self.hook];
+    if (appended) {
+        self.hook[@"addedAt"] = QBDINewAddedAt();
+        [store.hooks addObject:self.hook];
+    }
     if (![store save]) {
         if (appended) [store.hooks removeObjectIdenticalTo:self.hook];
         [self alert:@"错误" message:@"保存失败(检查配置目录权限)。"];

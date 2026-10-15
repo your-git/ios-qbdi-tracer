@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import "ListSort.h"
 
 /* 全局设置与路径中心。
  *
@@ -41,6 +42,12 @@ NSString *QBDIDefaultExportRoot(void); /* <Documents>/ios-qbdi-tracer-config-jso
 @property (nonatomic, copy) NSString *logRoot;
 /* 导入导出根目录。只有控制 App 用,引擎不关心。 */
 @property (nonatomic, copy) NSString *exportRoot;
+/* 两个列表独立保存显示顺序，不影响引擎。旧设置默认旧到新。 */
+@property (nonatomic, assign) QBDIListSortMode traceSortMode;
+@property (nonatomic, assign) QBDIListSortMode hookSortMode;
+/* 文件导入分页的独立排序选择，默认文件修改时间新到旧。 */
+@property (nonatomic, assign) QBDIListSortMode traceImportSortMode;
+@property (nonatomic, assign) QBDIListSortMode hookImportSortMode;
 
 - (void)load;
 - (BOOL)save;
