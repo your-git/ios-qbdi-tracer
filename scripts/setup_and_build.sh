@@ -1,5 +1,7 @@
 #!/bin/bash
-# macOS 统一入口：检查环境、安装缺失工具、构建官方 QBDI/Dobby、打包。
+# macOS 统一入口：检查环境、安装缺失工具、获取 QBDI/Dobby 依赖、打包。
+# 依赖获取顺序：根目录已有的 deps*.tar.gz → GitHub Release 下载 →
+# 都失败才从源码编译 QBDI/Dobby。
 # 兼容 macOS 自带 Bash 3.2；不要用 sudo 运行整个脚本。
 set -euo pipefail
 
@@ -8,32 +10,64 @@ MODE=build
 RELEASE=0
 ERRORS=0
 WORK_DIR=""
+PROXY_URL=""
 
 usage() {
     cat <<'EOF'
-用法: ./scripts/setup_and_build.sh [--release] [--check | --setup-only]
-  默认          安装缺失工具，编译 QBDI/Dobby，生成两种 deb
-  --release, -r 生成发布版（FINALPACKAGE=1）
-  --check       只检查环境和网络，不安装、不编译、不修改文件
-  --setup-only  只准备工具和 Theos，不编译 QBDI/Dobby 和项目
-  --help, -h    显示帮助
+用法: ./scripts/setup_and_build.sh [--release] [--check | --setup-only] [--proxy-port 端口]
+
+  默认            安装缺失工具，获取 QBDI/Dobby 依赖，生成两种 deb
+  --release, -r   生成发布版（FINALPACKAGE=1）
+  --check         只检查环境和网络，不安装、不编译、不修改文件
+  --setup-only    只准备工具和 Theos，不编译 QBDI/Dobby 和项目
+  --proxy-port N  走本机 127.0.0.1:N 的代理访问 GitHub（如 --proxy-port 7898）
+  --proxy URL     走指定代理（如 socks5://127.0.0.1:7898）
+  --help, -h      显示帮助
+
+依赖获取顺序：根目录已有的 deps*.tar.gz → GitHub Release 下载 →
+都失败才从源码编译 QBDI/Dobby（约 20-40 分钟）。
 
 请先安装完整 Xcode 并完成首次启动。Homebrew 首次安装可能需要管理员密码。
 Theos 使用已有 THEOS 环境变量，否则使用 ~/theos；无需手动 export。
 EOF
 }
 
-for arg in "$@"; do
-    case "$arg" in
-        --release|-r) RELEASE=1 ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --release|-r) RELEASE=1; shift ;;
         --check|--setup-only)
             [ "$MODE" = build ] || { echo "❌ --check 与 --setup-only 不可重复或混用" >&2; exit 2; }
-            MODE="${arg#--}"
+            MODE="${1#--}"
+            shift
+            ;;
+        --proxy-port)
+            [ $# -ge 2 ] || { echo "❌ --proxy-port 需要一个端口号" >&2; exit 2; }
+            case "$2" in
+                ''|*[!0-9]*) echo "❌ 端口必须是数字: $2" >&2; exit 2 ;;
+            esac
+            PROXY_URL="http://127.0.0.1:$2"
+            shift 2
+            ;;
+        --proxy)
+            [ $# -ge 2 ] || { echo "❌ --proxy 需要一个代理地址" >&2; exit 2; }
+            PROXY_URL="$2"
+            shift 2
             ;;
         --help|-h) usage; exit 0 ;;
-        *) echo "❌ 未知参数: $arg" >&2; usage >&2; exit 2 ;;
+        *) echo "❌ 未知参数: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+# ---------- 代理 ----------
+# 显式参数优先；否则沿用环境里已有的代理设置。curl / git / brew 都认这些变量。
+if [ -z "$PROXY_URL" ]; then
+    PROXY_URL="${HTTPS_PROXY:-${https_proxy:-}}"
+fi
+if [ -n "$PROXY_URL" ]; then
+    export HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL" ALL_PROXY="$PROXY_URL"
+    export http_proxy="$PROXY_URL" https_proxy="$PROXY_URL" all_proxy="$PROXY_URL"
+    export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,::1}"
+fi
 
 fail() { echo "❌ $*" >&2; exit 1; }
 problem() { echo "❌ $*" >&2; ERRORS=$((ERRORS + 1)); }
@@ -74,12 +108,21 @@ if [ "$MODE" != check ] && [ "$ERRORS" -ne 0 ]; then
 fi
 
 echo "[2/5] 检查 GitHub 网络"
+if [ -n "$PROXY_URL" ]; then
+    echo "ℹ️ 使用代理: $PROXY_URL"
+fi
 NETWORK_OK=1
-if ! curl --fail --location --silent --show-error --connect-timeout 10 --max-time 30 \
+if ! curl --fail --location --silent --show-error --connect-timeout 30 --max-time 30 \
     --output /dev/null https://github.com/; then
     NETWORK_OK=0
     if [ "$MODE" = check ]; then
-        problem "无法连接 GitHub。请检查网络或终端代理配置（HTTPS_PROXY），然后重试。"
+        # 注意：macOS 自带 bash 3.2 里变量引用紧跟多字节字符时，会把该字符的首字节
+        # 并入变量名并报 "unbound variable"。所以下面必须用带花括号的 ${PROXY_URL}。
+        if [ -n "$PROXY_URL" ]; then
+            problem "无法连接 GitHub（已尝试代理 ${PROXY_URL}）。请检查网络，或用 --proxy-port 端口 指定代理后重试。"
+        else
+            problem "无法连接 GitHub。请检查网络，或用 --proxy-port 端口 指定代理后重试。"
+        fi
     else
         echo "ℹ️ GitHub 暂不可用；仅当所有工具和项目依赖已齐备时可以继续。"
     fi
@@ -87,7 +130,7 @@ else
     echo "✅ GitHub 可连接（实际 clone / 下载失败时仍会停止）"
 fi
 need_network() {
-    [ "$NETWORK_OK" -eq 1 ] || fail "此步骤需要下载。请检查 GitHub 网络或终端代理配置（HTTPS_PROXY），然后重试。"
+    [ "$NETWORK_OK" -eq 1 ] || fail "此步骤需要下载。请检查网络，或用 --proxy-port 端口 指定代理后重试。"
 }
 
 echo "[3/5] 检查 / 安装构建工具"
@@ -207,11 +250,36 @@ run_project_script() {
     fi
     /bin/sh "$script" "$@"
 }
+# 依赖获取的三种情况：本地压缩包 → GitHub 下载 → 源码编译
+FETCH_ARGS=()
+if [ -n "$PROXY_URL" ]; then
+    FETCH_ARGS=(--proxy "$PROXY_URL")
+fi
+acquire_deps() {
+    echo "项目内没有 QBDI / Dobby 依赖，按以下顺序获取："
+    echo "  1) 工程根目录已有的 deps*.tar.gz"
+    echo "  2) 从 GitHub Release 下载"
+    echo "  3) 前两者都不行 → 从源码编译（约 20-40 分钟）"
+    echo
+    if run_project_script "$ROOT/scripts/fetch_deps.sh" --no-hint "$ROOT" \
+        ${FETCH_ARGS[@]+"${FETCH_ARGS[@]}"}; then
+        echo "✅ 已通过压缩包 / Release 获取依赖"
+    else
+        echo
+        echo "ℹ️ 本地压缩包和 GitHub 下载都没成功，回退到从源码编译 QBDI / Dobby。"
+        [ "$NETWORK_OK" -eq 1 ] || fail "源码编译也需要访问 GitHub。请用 --proxy-port 端口 指定代理，或手动把 deps*.tar.gz 放到工程根目录后重试。"
+        run_project_script "$ROOT/scripts/build_deps_ios.sh"
+    fi
+    deps_ready || fail "依赖仍不完整（Engine/lib/arm64 与 Engine/include）。请检查上面的输出。"
+}
 if [ "$MODE" = check ]; then
     if deps_ready; then
         echo "✅ 已有 QBDI / Dobby 静态库和关键头文件"
     else
-        echo "ℹ️ QBDI / Dobby 依赖尚未齐备；默认模式会从官方仓库下载源码并编译。"
+        echo "ℹ️ QBDI / Dobby 依赖尚未齐备；默认模式会依次尝试："
+        echo "   1) 解压根目录已有的 deps*.tar.gz"
+        echo "   2) 从 GitHub Release 下载"
+        echo "   3) 都失败则从源码编译（约 20-40 分钟）"
     fi
     [ "$ERRORS" -eq 0 ] || fail "发现 $ERRORS 项环境问题。修复 Xcode / 网络后，可运行默认模式安装缺失工具。"
     echo "✅ 环境检查通过。"
@@ -222,9 +290,7 @@ else
     if deps_ready; then
         echo "✅ 复用项目内现有 QBDI / Dobby 依赖"
     else
-        need_network
-        run_project_script "$ROOT/scripts/build_deps_ios.sh"
-        deps_ready || fail "依赖构建后仍缺少静态库或关键头文件，请检查构建输出。"
+        acquire_deps
     fi
     if [ "$RELEASE" -eq 1 ]; then
         run_project_script "$ROOT/scripts/build_debs.sh" --release

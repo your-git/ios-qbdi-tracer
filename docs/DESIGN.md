@@ -199,7 +199,7 @@ QBDI。引擎会阻止这种情况下的嵌套授权,但配置时仍应选不会
 各打一次,内容是"表达式算出的地址 + 实际读到的数据 + 期望值":
 
 ```
-[MusicallyCore] trigger miss #1: [x2+0x10] = 0x280691000
+[ExampleModule] trigger miss #1: [x2+0x10] = 0x280691000
     want: bytes prefix 08a48c90
     got : 0000000028043...  (read 0x4 bytes)
 ```
@@ -285,7 +285,7 @@ GUI 还保存独立的 `traceSortMode` / `hookSortMode`：0=名称 A–Z，1=名
       "id": "uuid",                   // 条目唯一 id
       "enabled": true,                // 该条目勾选状态
       "traceName": "登录签名计算",     // 可选的用户自定义名称;缺省/空=旧版展示
-      "bundleId": "com.zhiliaoapp.musically",
+      "bundleId": "com.example.exampleapp",
       "appName": "settings",            // 仅 UI 展示
       "module": "MainModule",      // dyld 镜像名子串
       "start": "0x27A1F4E0",          // 相对模块基址偏移(hex 字符串)
@@ -345,7 +345,7 @@ GUI 还保存独立的 `traceSortMode` / `hookSortMode`：0=名称 A–Z，1=名
       "id": "uuid",
       "enabled": true,                 // 该条目勾选状态
       "hookName": "登录返回值改写",     // 可选自定义名称
-      "bundleId": "com.zhiliaoapp.musically",
+      "bundleId": "com.example.exampleapp",
       "appName": "settings",             // 仅 UI 展示
       "module": "MainModule",         // dyld 镜像名子串
       "target": "0x27A1F4E0",          // 目标地址:相对模块基址偏移(Dobby hook 落点)

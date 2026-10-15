@@ -73,7 +73,7 @@ export THEOS=/path/to/theos   # 指向你的 Theos 安装目录
 
 **方式 A — 下载预编译(推荐,秒级)**
 
-从项目 GitHub Release 下载 `deps-arm64-*.tar.gz`,解压到工程根目录,得到:
+从项目 GitHub Release 下载 `deps-v*.tar.gz`,解压到工程根目录,得到:
 ```
 Engine/lib/arm64/{libQBDI.a, libdobby.a}
 Engine/include/{QBDI.h, QBDI/, dobby.h, ...}

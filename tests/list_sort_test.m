@@ -140,14 +140,14 @@ int main(void) { @autoreleasepool {
     assert(([importedHook[@"addedAt"] doubleValue] > 456));
     assert((![importedHook[@"id"] isEqual:hook[@"id"]]));
     assert(([importedHook[@"mods"] count] == 1));
-    trace[@"appName"] = @"TikTok";
-    hook[@"appName"] = @"TikTok";
+    trace[@"appName"] = @"ExampleApp";
+    hook[@"appName"] = @"ExampleApp";
     NSString *tracePath = [traces exportItem:trace error:&error];
     NSString *hookPath = [hooks exportHook:hook error:&error];
     assert((tracePath && hookPath && !error));
     for (NSString *path in @[ tracePath, hookPath ]) {
         NSString *prefix = [path isEqual:tracePath] ? @"trace" : @"hook";
-        NSString *pattern = [NSString stringWithFormat:@"^%@_TikTok[0-9]{14}\\.json$", prefix];
+        NSString *pattern = [NSString stringWithFormat:@"^%@_ExampleApp[0-9]{14}\\.json$", prefix];
         NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
         NSString *name = path.lastPathComponent;
         assert(([regex numberOfMatchesInString:name options:0 range:NSMakeRange(0, name.length)] == 1));
